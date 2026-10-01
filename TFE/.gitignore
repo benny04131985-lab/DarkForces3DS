@@ -1,0 +1,90 @@
+# Prerequisites
+*.d
+
+# Compiled Object files
+*.slo
+*.lo
+*.o
+*.obj
+*.iobj
+*.ipch
+*.idb
+*.db
+*.suo
+*.pdb
+*.ipdb
+*.ilk
+*.exp
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Compiled Dynamic libraries
+*.so
+*.dylib
+*.dll
+*.res
+
+# Fortran module files
+*.mod
+*.smod
+
+# Compiled Static libraries
+*.lai
+*.la
+*.a
+*.lib
+
+# Executables
+*.exe
+*.out
+*.app
+
+# Text Files
+*.log
+*.tlog
+*.user
+*.ini
+*.patch
+*.orig
+*.rej
+
+# Other File Types
+*.aps
+*.ico
+*.bin
+*.tfs
+*~
+
+#Directories
+.vs/
+Internal/
+TheForceEngine/Games/
+TheForceEngine/ModCache/
+TheForceEngine/Mods/
+TheForceEngine/screenshots/
+TheForceEngine/Reference/
+TheForceEngine/Replays/
+TheForceEngine/LawMaker/
+TheForceEngine/Backup/
+TheForceEngine/Exports/
+TheForceEngine/VTune Profiler Results/
+TheForceEngine/glslang/
+TheForceEngine/Documentation/blog posts/
+BuildExes/
+Build/
+TheForceEngine/bug_reports/
+WDFuseCommonFiles/
+x64/Debug/
+CMakeFiles/
+
+# Linux
+TheForceEngine/tfelnx
+
+# Ignore dumps
+*.dmp
+
+# ignore recipe
+*.recipe
+.DS_Store

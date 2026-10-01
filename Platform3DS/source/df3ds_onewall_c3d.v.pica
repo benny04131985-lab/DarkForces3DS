@@ -1,0 +1,30 @@
+; DF3DS_C3D7_OPAQUEWORLD1_V8_SHADER
+; C3D4 direct homogeneous Z is retained exactly; C3D7 only adds texcoord0 passthrough.
+.fvec projection[4]
+.fvec screenParams
+.constf constants(0.0, 1.0, -1.0, 0.0078125)
+.out outpos position
+.out outclr color
+.out outtex texcoord0
+.alias inpos v0
+.alias inclr v1
+.alias intex v2
+.proc main
+    mul r0.x, screenParams.xxxx, inpos.xxxx
+    mul r1.x, screenParams.zzzz, inpos.yyyy
+    add r0.x, r0, r1
+    mul r0.y, screenParams.yyyy, inpos.zzzz
+    mul r0.y, constants.zzzz, r0
+    mul r1.y, screenParams.wwww, inpos.yyyy
+    add r0.y, r1, r0
+    mul r0.z, constants.zzzz, inpos.yyyy
+    add r0.z, constants.wwww, r0
+    mov r0.w, inpos.yyyy
+    dp4 outpos.x, projection[0], r0
+    dp4 outpos.y, projection[1], r0
+    mov outpos.z, r0.zzzz
+    dp4 outpos.w, projection[3], r0
+    mov outclr, inclr
+    mov outtex, intex
+    end
+.end

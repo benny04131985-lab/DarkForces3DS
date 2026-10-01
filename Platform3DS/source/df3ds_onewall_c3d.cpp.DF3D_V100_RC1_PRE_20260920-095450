@@ -1,0 +1,2159 @@
+// DF3DS_C3D4_ONEWALL1_V1_MODULE
+#include "df3ds_onewall_c3d.h"
+#include <3ds.h>
+#include <citro3d.h>
+#include <algorithm>
+#include <cstdio>
+#include "df3ds_onewall_c3d_shbin.h"
+#include <cmath>
+
+namespace TFE_RenderBackend { const u16* df3dsC3D8Palette565(); }
+
+namespace DF3DS_OneWallC3D
+{
+namespace
+{
+    // DF3DS_C3D5_SOLIDWALLS1_V1
+    constexpr std::uint32_t kCarrierCapacity = 256u;
+    // DF3DS_C3D6_ADJOINWALLS1_V3
+    constexpr std::uint32_t kDrawCapacity = 512u;
+    constexpr std::uint32_t kVerticesPerWall = 6u;
+    // DF3DS_C3D7_OPAQUEWORLD1_V8
+    constexpr std::uint32_t kVertexCapacity = 24576u;
+    constexpr std::uint32_t kFlatPolyMax = 512u;
+    constexpr std::uint32_t kFlatTriCapacity = 8192u;
+    constexpr std::uint32_t kFlatSectorCapacity = 256u;
+    constexpr float kInvFixed = 1.0f / 65536.0f;
+
+    struct Carrier { const void* key; std::int32_t x0,z0,x1,z1,floorHeight,ceilingHeight,projectedX0,projectedX1; std::int32_t uCoord0,uScale,orientDzDx,midOffsetX,midOffsetZ,midTexelHeight,midTextureWidth,flipHoriz,hasMidTexture; };
+    struct DrawWall
+    {
+        Carrier carrier;
+        const void* mirrorKey; // DF3DS_C3D27_MIRRORPAIR1_V3 telemetry only
+        std::int32_t drawX0,drawX1;
+        std::int32_t eyeHeight,focalLength,focalLenAspect,projOffsetX,projOffsetY;
+        std::int32_t topHeight,bottomHeight;
+        std::int32_t c28CaptureX0,c28CaptureX1;
+        std::uint32_t c28Columns,c28VisibleColumns,c28EmptyColumns,c28ClampedColumns;
+        std::int32_t c28RangeMatch;
+        SurfaceClass surfaceClass;
+    };
+    struct OneWallVertex { float position[4]; float color[4]; float texcoord[4]; };
+    struct FixedXZ { std::int32_t x,z; };
+    struct MaterialView { const void* key; const std::uint8_t* image; std::int32_t width,height,logSizeY,palIndex,offsetX,offsetZ,texelHeight,flipHoriz; };
+    struct WallMaterialSet { const void* wallKey; MaterialView solid,upper,lower; };
+    struct FlatPoint { float x,z; std::int32_t wx,wz; };
+    struct TriIndex { int a,b,c; };
+    struct FlatTri { FlatPoint p[3]; std::int32_t worldHeight,eyeHeight,focalLength,focalLenAspect,projOffsetX,projOffsetY; SurfaceClass surfaceClass; MaterialView material; };
+    // DF3DS_C3D11_TAKEOVERFIX1_V2: wall-topology flat construction.
+    struct FlatEdge { std::int32_t a,b; };
+    struct FlatSectorBuild
+    {
+        const void* key; const FixedXZ* ws; const FixedXZ* vs;
+        std::int32_t vertexCount,edgeStart,edgeCount;
+        std::int32_t floorHeight,ceilingHeight,eyeHeight,focalLength,focalLenAspect,projOffsetX,projOffsetY;
+        MaterialView floorMat,ceilMat; bool finalized,failed;
+    };
+    struct NativeTexture { const void* key; const void* lightKey; C3D_Tex tex; bool active,alpha; std::uint16_t sourceW,sourceH,gpuW,gpuH; };
+    struct WeaponLayer
+    {
+        MaterialView material; const std::uint8_t* light;
+        std::int32_t x,y,xScale,yScale,clipX0,clipY0,clipX1,clipY1,scaled,lit;
+    };
+    // DF3DS_C3D10_NATIVEPLANES1_V2: native billboard state carries authoritative object/frame ownership.
+    struct SpriteLayer
+    {
+        const void* cellKey; const std::uint8_t* cell; const std::uint8_t* image; const std::uint32_t* columnOffset; const std::uint8_t* light;
+        std::int32_t width,height,compressed,flip;
+        std::int32_t objXWS,objYWS,objZWS,objXVS,objYVS,objZVS;
+        std::int32_t frameOffsetX,frameOffsetY,frameWidthWS,frameHeightWS;
+        std::int32_t focalLength,focalLenAspect,projOffsetX,projOffsetY,sourceKind;
+    };
+    struct SpriteNativeTexture
+    {
+        const void* cellKey; const void* lightKey; C3D_Tex tex; bool active; std::uint16_t sourceW,sourceH,gpuW,gpuH; std::uint64_t frameSerial;
+    };
+    struct SpriteAnchorSample
+    {
+        std::int32_t kind,objXWS,objYWS,objZWS,objXVS,objYVS,objZVS,offX,offY,widthWS,heightWS,leftVS,topVS,rightVS,bottomVS;
+    };
+    // DF3DS_C3D18_SIGN1_V1: one native SIGN owner per classic wall; a wall can replay on solid/upper/lower strips.
+    struct C18SignLayer
+    {
+        const void* wallKey; MaterialView material; std::int32_t offsetX,offsetZ,transparent,illumSign;
+    };
+    struct C18SignState { const void* wallKey; const void* textureKey; bool active; };
+    struct C18SignDraw
+    {
+        NativeTexture* texture; std::uint32_t vertexStart; std::int32_t focalLength,focalLenAspect,projOffsetX,projOffsetY;
+        std::int32_t transparent,illumSign;
+    };
+
+
+    Carrier gCarriers[kCarrierCapacity]{};
+    DrawWall gDraws[kDrawCapacity]{};
+    std::uint32_t gCarrierCount=0, gCarrierOverflow=0, gLookupMiss=0;
+    std::uint32_t gDrawCount=0, gDrawOverflow=0;
+
+    // DF3DS_C3D27_MIRRORPAIR1_V3: observation only; never gates a draw.
+    struct C27PairSample { const void* wall; const void* mirror; std::int32_t ax0,ax1,bx0,bx1; std::uint32_t surface; };
+    constexpr std::uint32_t kC27PairSampleCapacity=64u;
+    C27PairSample gC27PairSamples[kC27PairSampleCapacity]{};
+    std::uint32_t gC27PairSampleCount=0,gC27PairSampleOverflow=0;
+    std::uint32_t gC27PairFrames=0,gC27PairMatches=0,gC27PairOverlaps=0,gC27LowerPairOverlaps=0,gC27UpperPairOverlaps=0;
+
+    void c27AuditMirrorPairs()
+    {
+        ++gC27PairFrames;
+        for(std::uint32_t i=0;i<gDrawCount;++i)
+        {
+            const DrawWall& a=gDraws[i];
+            if(!a.mirrorKey || (a.surfaceClass!=Surface_Lower && a.surfaceClass!=Surface_Upper)) continue;
+            for(std::uint32_t j=i+1;j<gDrawCount;++j)
+            {
+                const DrawWall& b=gDraws[j];
+                if(b.carrier.key!=a.mirrorKey || b.surfaceClass!=a.surfaceClass) continue;
+                ++gC27PairMatches;
+                const std::int32_t lo=a.drawX0>b.drawX0?a.drawX0:b.drawX0;
+                const std::int32_t hi=a.drawX1<b.drawX1?a.drawX1:b.drawX1;
+                if(lo>hi) continue;
+                ++gC27PairOverlaps;
+                if(a.surfaceClass==Surface_Lower) ++gC27LowerPairOverlaps; else ++gC27UpperPairOverlaps;
+                if(gC27PairSampleCount<kC27PairSampleCapacity)
+                    gC27PairSamples[gC27PairSampleCount++]={a.carrier.key,a.mirrorKey,a.drawX0,a.drawX1,b.drawX0,b.drawX1,(std::uint32_t)a.surfaceClass};
+                else ++gC27PairSampleOverflow;
+                break;
+            }
+        }
+    }
+
+    struct C39WallLifeRow
+    {
+        std::uint64_t frame;
+        const void* wallKey;
+        std::int32_t drawX0,drawX1;
+        std::int32_t topHeight,bottomHeight;
+        std::int32_t focalLength,focalLenAspect,projOffsetX,projOffsetY;
+        std::uint32_t valid,vertexStart;
+        float vx0,vz0,vyTop,vx1,vz1,vyBottom;
+    };
+    constexpr std::uint32_t kC39WallLifeCap=2048;
+    C39WallLifeRow gC39WallLife[kC39WallLifeCap]{};
+    std::uint32_t gC39WallLifeHead=0,gC39WallLifeCount=0;
+
+    bool gProofLogged=false;
+    std::uint64_t gFrameSerial=0, gPresentedSerial=~std::uint64_t(0);
+
+    // DF3DS_C3D55_OWNERTRACE1_V3 — bounded ownership tracer.
+    constexpr std::uintptr_t kOTTargetWall=0x08968df0u;
+    constexpr std::uint32_t kOTEventCap=64u,kOTNativeCap=16u,kOTClassicOverlayCap=8u,kOTSignCap=8u;
+    enum : std::uint32_t { OT_SOLID=1u,OT_UPPER=2u,OT_LOWER=4u,OT_MASK=8u,OT_TRANS=16u };
+
+    struct OTClassicOverlay
+    {
+        const void* wallKey; const void* textureKey; const void* imagePtr;
+        std::uint32_t route,wallFlags; std::int32_t drawFlags,x0,x1;
+    };
+    struct OTNative
+    {
+        const void* wallKey; const void* materialKey; const void* imagePtr; const void* gpuKey;
+        std::uint32_t cls,alpha; std::int32_t x0,x1,topHeight,bottomHeight;
+    };
+    struct OTSign
+    {
+        const void* wallKey; const void* materialKey; const void* imagePtr;
+        std::int32_t transparent,illumSign;
+    };
+    struct OTEvent
+    {
+        std::uint64_t frame,signature;
+        std::uint32_t targetRoutes,targetWallFlags;
+        std::int32_t targetDrawFlags,targetX0,targetX1,targetY0,targetY1;
+        const void* targetTextureKey; const void* targetImagePtr;
+        std::uint32_t nativeCount,classicOverlayCount,signCount,nativeOverflow,classicOverlayOverflow,signOverflow;
+        OTNative native[kOTNativeCap];
+        OTClassicOverlay classicOverlay[kOTClassicOverlayCap];
+        OTSign sign[kOTSignCap];
+    };
+    struct OTFrameState
+    {
+        std::uint32_t routes,wallFlags;
+        std::int32_t drawFlags,x0,x1,y0,y1;
+        const void* textureKey; const void* imagePtr;
+        OTClassicOverlay overlays[kOTClassicOverlayCap];
+        std::uint32_t overlayCount,overlayOverflow;
+    };
+
+    OTFrameState gOTFrame{};
+    OTEvent gOTEvents[kOTEventCap]{};
+    std::uint32_t gOTEventWrite=0,gOTEventTotal=0;
+    std::uint64_t gOTLastSignature=0,gOTLastStoredFrame=0;
+
+    static void otResetFrame()
+    {
+        gOTFrame={};
+        gOTFrame.x0=0x7fffffff;gOTFrame.x1=-0x7fffffff;
+        gOTFrame.y0=0x7fffffff;gOTFrame.y1=-0x7fffffff;
+        gOTFrame.drawFlags=-1;
+    }
+    static bool otIsTarget(const void* p)
+    {
+        return reinterpret_cast<std::uintptr_t>(p)==kOTTargetWall;
+    }
+    static void otMarkTarget(std::uint32_t route,const void* textureKey,const void* imagePtr,
+                             std::uint32_t wallFlags,std::int32_t drawFlags,
+                             std::int32_t x0,std::int32_t x1)
+    {
+        gOTFrame.routes|=route;
+        gOTFrame.wallFlags=wallFlags;
+        if(drawFlags>=0)gOTFrame.drawFlags=drawFlags;
+        if(textureKey)gOTFrame.textureKey=textureKey;
+        if(imagePtr)gOTFrame.imagePtr=imagePtr;
+        gOTFrame.x0=std::min(gOTFrame.x0,x0);gOTFrame.x1=std::max(gOTFrame.x1,x1);
+    }
+    static void otAddClassicOverlay(const void* wallKey,const void* textureKey,const void* imagePtr,
+                                    std::uint32_t route,std::uint32_t wallFlags,std::int32_t drawFlags,
+                                    std::int32_t x0,std::int32_t x1)
+    {
+        if(gOTFrame.overlayCount>=kOTClassicOverlayCap){++gOTFrame.overlayOverflow;return;}
+        gOTFrame.overlays[gOTFrame.overlayCount++]={wallKey,textureKey,imagePtr,route,wallFlags,drawFlags,x0,x1};
+    }
+    static void otHashMix(std::uint64_t& h,std::uint64_t v)
+    {
+        h^=v;h*=1099511628211ull;
+    }
+
+
+
+
+    // DF3DS_C3D43_VPARITY1_V2: exact classic portal-column coverage discriminator.
+    enum C43Mode : std::uint32_t { C43_BASELINE=0, C43_CLASSIC_PORTAL_COVERAGE=1, C43_MODE_COUNT=2 };
+    std::uint32_t gC43Mode=C43_BASELINE;
+    const char* c43ModeName(std::uint32_t m){return m==C43_CLASSIC_PORTAL_COVERAGE?"CLASSIC_PORTAL_COVERAGE":"BASELINE";}
+    void c43LogMode(const char* why)
+    {
+        FILE* f=nullptr /* C48 CLEAN1 disabled legacy diagnostic log */;
+        if(!f)return;
+        std::fprintf(f,"frame=%llu mode=%lu name=%s why=%s\n",(unsigned long long)gFrameSerial,(unsigned long)gC43Mode,c43ModeName(gC43Mode),why?why:"?");
+        std::fclose(f);
+    }
+    struct C43PortalColumn { const void* wallKey; std::uint32_t surfaceClass; std::int32_t x,top,bottom; };
+    constexpr std::uint32_t kC43PortalColumnCapacity=4096u;
+    C43PortalColumn gC43PortalColumns[kC43PortalColumnCapacity]{};
+    std::uint32_t gC43PortalColumnCount=0,gC43PortalColumnOverflow=0;
+    void c43CapturePortalColumn(const void* wallKey,std::int32_t x,std::int32_t top,std::int32_t bottom,SurfaceClass cls)
+    {
+        if(!wallKey||(cls!=Surface_Upper&&cls!=Surface_Lower)||top>bottom)return;
+        if(gC43PortalColumnCount>=kC43PortalColumnCapacity){++gC43PortalColumnOverflow;return;}
+        gC43PortalColumns[gC43PortalColumnCount++]={wallKey,std::uint32_t(cls),x,top,bottom};
+    }
+
+    // DF3DS_C3D48_CLEAN1_V2: clean textured mono baseline.
+
+
+    // DF3DS_C3D53_PORTALLINE1_V1
+    // Bounded in-memory recursion trace. No hot-path file I/O and no O(N) census.
+    struct PLPortalRec
+    {
+        std::uint64_t frame,serial;
+        const void* portalWall;
+        const void* curSector;
+        const void* nextSector;
+        std::int32_t depth,childX0,childX1,childMinY,childMaxY;
+        std::int32_t wallX0,wallX1,z0,z1;
+        std::int32_t curFloor,curCeil,nextFloor,nextCeil;
+        std::uint32_t curFlags,nextFlags;
+    };
+    struct PLClipRec
+    {
+        std::uint64_t frame,portalSerial;
+        const void* wallKey;
+        std::uint32_t surfaceClass;
+        std::int32_t depth,x,top,bottom;
+    };
+    struct PLStackEntry { std::uint64_t serial; std::int32_t depth; };
+
+    constexpr std::uint32_t kPLPortalCap=128u;
+    constexpr std::uint32_t kPLClipCap=768u;
+    constexpr std::uint32_t kPLStackCap=32u;
+    PLPortalRec gPLPortals[kPLPortalCap]{};
+    PLClipRec gPLClips[kPLClipCap]{};
+    PLStackEntry gPLStack[kPLStackCap]{};
+    std::uint32_t gPLPortalCount=0,gPLClipCount=0,gPLStackDepth=0;
+    std::uint32_t gPLPortalOverflow=0,gPLClipOverflow=0,gPLStackOverflow=0;
+    std::uint64_t gPLSerial=0,gPLStartFrame=0;
+    bool gPLFlushed=false;
+    char gPLLogPath[256]{};
+
+    static bool plInCaptureWindow()
+    {
+        return !gPLFlushed && gPLStartFrame && gFrameSerial<=gPLStartFrame+2u;
+    }
+
+    static void plRecordClip(
+        const void* wallKey,std::int32_t x,std::int32_t top,std::int32_t bottom,std::uint32_t surfaceClass)
+    {
+        if(!plInCaptureWindow()||!wallKey||top>bottom||gPLStackDepth==0u)return;
+        if(gPLClipCount>=kPLClipCap){++gPLClipOverflow;return;}
+        const PLStackEntry& st=gPLStack[gPLStackDepth-1u];
+        gPLClips[gPLClipCount++]={gFrameSerial,st.serial,wallKey,surfaceClass,st.depth,x,top,bottom};
+    }
+
+    static void plFlush(const char* why)
+    {
+        if(gPLFlushed||!gPLStartFrame)return;
+        gPLFlushed=true;
+        std::snprintf(gPLLogPath,sizeof(gPLLogPath),
+            "sdmc:/3ds/DarkForces3DS/logs/DF3D_C3D53_PORTALLINE1_V1_%llu.log",
+            (unsigned long long)osGetTime());
+        FILE* f=std::fopen(gPLLogPath,"w");
+        if(!f)return;
+        std::fprintf(f,
+            "DF3D C3D53 PORTALLINE1 V1\nwhy=%s startFrame=%llu portalCount=%lu clipCount=%lu "
+            "portalOverflow=%lu clipOverflow=%lu stackOverflow=%lu\n",
+            why?why:"?",
+            (unsigned long long)gPLStartFrame,
+            (unsigned long)gPLPortalCount,(unsigned long)gPLClipCount,
+            (unsigned long)gPLPortalOverflow,(unsigned long)gPLClipOverflow,
+            (unsigned long)gPLStackOverflow);
+        for(std::uint32_t i=0;i<gPLPortalCount;++i)
+        {
+            const PLPortalRec& r=gPLPortals[i];
+            std::fprintf(f,
+                "P frame=%llu serial=%llu depth=%ld portal=%p cur=%p next=%p "
+                "childX=%ld..%ld childY=%ld..%ld wallX=%ld..%ld z=%ld..%ld "
+                "curH=%ld..%ld nextH=%ld..%ld curFlags=0x%08lx nextFlags=0x%08lx\n",
+                (unsigned long long)r.frame,(unsigned long long)r.serial,(long)r.depth,
+                r.portalWall,r.curSector,r.nextSector,
+                (long)r.childX0,(long)r.childX1,(long)r.childMinY,(long)r.childMaxY,
+                (long)r.wallX0,(long)r.wallX1,(long)r.z0,(long)r.z1,
+                (long)r.curCeil,(long)r.curFloor,(long)r.nextCeil,(long)r.nextFloor,
+                (unsigned long)r.curFlags,(unsigned long)r.nextFlags);
+        }
+        for(std::uint32_t i=0;i<gPLClipCount;++i)
+        {
+            const PLClipRec& r=gPLClips[i];
+            std::fprintf(f,
+                "C frame=%llu portalSerial=%llu depth=%ld wall=%p cls=%lu x=%ld y=%ld..%ld\n",
+                (unsigned long long)r.frame,(unsigned long long)r.portalSerial,
+                (long)r.depth,r.wallKey,(unsigned long)r.surfaceClass,
+                (long)r.x,(long)r.top,(long)r.bottom);
+        }
+        std::fclose(f);
+    }
+
+    static void plMaybeFlush()
+    {
+        if(!gPLFlushed&&gPLStartFrame&&gFrameSerial>gPLStartFrame+2u)plFlush("WINDOW_COMPLETE");
+    }
+
+    DVLB_s* gDvlb=nullptr;
+    shaderProgram_s gProgram{};
+    bool gProgramInit=false,gGpuReady=false;
+    int gProjectionUniform=-1,gScreenUniform=-1;
+    C3D_Mtx gProjection{};
+    OneWallVertex* gVertices=nullptr;
+    FlatTri gFlatTris[kFlatTriCapacity]{}; const void* gFlatSectorKeys[kFlatSectorCapacity]{};
+    std::uint32_t gFlatTriCount=0,gFlatSectorCount=0,gEarClipFail=0,gFlatTriOverflow=0,gFlatSectorOverflow=0,gVertexOverflow=0;
+    std::uint32_t gWallVertexStart[kDrawCapacity]{};
+    NativeTexture* gWallTex[kDrawCapacity]{}; NativeTexture* gFlatTex[kFlatTriCapacity]{};
+    constexpr std::uint32_t kWallMaterialCapacity=256u,kTextureCacheCapacity=320u,kWeaponLayerCapacity=8u;
+    WallMaterialSet gWallMaterials[kWallMaterialCapacity]{}; std::uint32_t gWallMaterialCount=0;
+    NativeTexture gTextureCache[kTextureCacheCapacity]{}; std::uint32_t gTextureEvictCursor=0;
+    WeaponLayer gWeaponLayers[kWeaponLayerCapacity]{}; std::uint32_t gWeaponLayerCount=0,gWeaponLayerOverflow=0; std::uint32_t gWeaponVertexStart[kWeaponLayerCapacity]{}; NativeTexture* gWeaponTex[kWeaponLayerCapacity]{}; bool gWeaponVertexValid[kWeaponLayerCapacity]{};
+    constexpr std::uint32_t kSpriteLayerCapacity=96u,kSpriteTextureCapacity=32u,kSpriteAnchorSampleCapacity=8u;
+    SpriteLayer gSpriteLayers[kSpriteLayerCapacity]{}; std::uint32_t gSpriteLayerCount=0,gSpriteLayerOverflow=0;
+    SpriteNativeTexture gSpriteTextures[kSpriteTextureCapacity]{}; std::uint32_t gSpriteTextureEvictCursor=0; std::uint64_t gSpritePaletteSeen=~0ull;
+    SpriteNativeTexture* gSpriteTex[kSpriteLayerCapacity]{}; std::uint32_t gSpriteVertexStart[kSpriteLayerCapacity]{}; bool gSpriteVertexValid[kSpriteLayerCapacity]{};
+    SpriteAnchorSample gSpriteAnchorSamples[kSpriteAnchorSampleCapacity]{}; std::uint32_t gSpriteAnchorSampleCount=0;
+    constexpr std::uint32_t kC18SignLayerCapacity=64u,kC18SignStateCapacity=64u,kC18SignDrawCapacity=192u;
+    C18SignLayer gC18SignLayers[kC18SignLayerCapacity]{}; std::uint32_t gC18SignLayerCount=0,gC18SignLayerOverflow=0;
+    C18SignState gC18SignStates[kC18SignStateCapacity]{}; std::uint32_t gC18SignStateCount=0,gC18SignStateOverflow=0,gC18SignStateChanges=0;
+    C18SignDraw gC18SignDraws[kC18SignDrawCapacity]{}; std::uint32_t gC18SignDrawCount=0,gC18SignDrawOverflow=0;
+    std::uint32_t gC18SignCaptureCalls=0,gC18SignTexResolved=0,gC18SignTexMiss=0,gC18SignSubmitted=0,gC18SignTransparentSubmitted=0,gC18SignIllumSubmitted=0;
+    std::uint32_t gC18SummaryMaxSignLayers=0,gC18SummaryMaxSignDraws=0;
+    std::uint8_t gSpriteDecodeColumn[1024]{};
+    std::uint32_t gSpriteTexHits=0,gSpriteTexMiss=0,gSpriteTexUploads=0,gSpriteTexEvicts=0,gSpriteTexBlocked=0;
+    std::uint32_t gSummaryMaxSpriteLayers=0,gSummarySpriteSubmitted=0,gSummarySpriteOverflow=0,gSummarySpriteTexUploads=0,gSummarySpriteTexEvicts=0,gSummarySpriteTexBlocked=0;
+    std::uint32_t gSummaryWaxSubmitted=0,gSummaryFmeSubmitted=0;
+    bool gSpriteProofWritten=false;
+    std::uint64_t gPaletteHash=0; std::uint32_t gPaletteReloads=0,gTextureUploads=0,gTextureUploadFail=0,gTextureEvicts=0;
+    std::uint32_t gWallTexHits=0,gWallTexMiss=0,gFlatTexHits=0,gFlatTexMiss=0,gWeaponTexHits=0,gWeaponTexMiss=0,gFlatCleaned=0;
+    std::uint32_t gSummaryMaxWalls=0,gSummaryMaxSolid=0,gSummaryMaxUpper=0,gSummaryMaxLower=0,gSummaryMaxUvWalls=0;
+    std::uint32_t gSummaryMaxFlatSectors=0,gSummaryMaxFlatTris=0,gSummaryMaxEarClipFail=0,gSummaryMaxFlatOverflow=0,gSummaryMaxVertexOverflow=0;
+    std::uint32_t gSummaryMaxWeaponLayers=0,gSummaryWallTexHits=0,gSummaryWallTexMiss=0,gSummaryFlatTexHits=0,gSummaryFlatTexMiss=0,gSummaryWeaponTexHits=0,gSummaryWeaponTexMiss=0;
+    std::uint32_t gSummaryTextureUploads=0,gSummaryTextureUploadFail=0,gSummaryTextureEvicts=0,gSummaryPaletteReloads=0,gSummaryFlatCleaned=0;
+    bool gSummaryDepthSubmitted=false,gSummaryWeaponSubmitted=false;
+    // DF3DS_C3D19_WALLCLIP1_V1: classic wallX0/wallX1 are the authoritative horizontal visibility window.
+    bool gC19WallVertexValid[kDrawCapacity]{};
+    std::uint32_t gC19WallClipFull=0,gC19WallClipPartial=0,gC19WallClipRejected=0,gC19WallClipLeft=0,gC19WallClipRight=0;
+    // DF3DS_C3D20_WALLCLASSAUD1_V1: evidence-only adjoin class discriminator + guaranteed runtime identity.
+    struct C20WallSample
+    {
+        const void* wallKey; const void* textureKey; std::uint32_t surfaceClass;
+        std::int32_t topHeight,bottomHeight,drawX0,drawX1,projectedX0,projectedX1;
+        std::int32_t offsetX,offsetZ,texelHeight,texWidth,texHeight;
+    };
+    constexpr std::uint32_t kC20WallSampleCapacity=64u;
+    C20WallSample gC20WallSamples[kC20WallSampleCapacity]{};
+    std::uint32_t gC20WallSampleCount=0,gC20WallSampleOverflow=0;
+    std::uint32_t gC20SolidDraws=0,gC20UpperDraws=0,gC20LowerDraws=0;
+    std::uint32_t gC20UpperInvalid=0,gC20LowerInvalid=0;
+    bool gC20IdentityWritten=false;
+    // DF3DS_C3D21_LOWERCLIPAUD1_V2: bounded classic lower-wall vertical-window parity evidence.
+    struct C21LowerClipSample
+    {
+        const void* wallKey;
+        std::int32_t x,rawTop,rawBottom,clippedTop,clippedBottom,windowTop,windowBottom,topDelta,bottomDelta,totalDelta;
+    };
+    constexpr std::uint32_t kC21LowerClipSampleCapacity=32u;
+    C21LowerClipSample gC21LowerClipSamples[kC21LowerClipSampleCapacity]{};
+    std::uint32_t gC21LowerColumns=0,gC21LowerAnyClamped=0,gC21LowerTopClamped=0,gC21LowerBottomClamped=0,gC21LowerBothClamped=0;
+    std::uint32_t gC21LowerEmptyAfterClamp=0,gC21LowerSampleReplaced=0;
+    std::int32_t gC21LowerMaxTopDelta=0,gC21LowerMaxBottomDelta=0,gC21LowerMaxTotalDelta=0;
+    // DF3DS_C3D22_MASKROUTE1_V1: bounded mask-route ownership proof.
+    struct C22MaskRouteSample
+    {
+        const void* wallKey; const void* textureKey; const void* nextSectorKey;
+        std::int32_t drawFlags,drawX0,drawX1,sectorExterior,nextExtAdj,nextExtFloorAdj,adjMidTex,stage;
+        std::uint32_t calls;
+    };
+    constexpr std::uint32_t kC22MaskRouteSampleCapacity=192u; // DF3DS_C3D32_EXTOWNER1_V3 telemetry headroom
+    C22MaskRouteSample gC22MaskRouteSamples[kC22MaskRouteSampleCapacity]{};
+    std::uint32_t gC22MaskRouteSampleCount=0,gC22MaskRouteSampleOverflow=0;
+    std::uint32_t gC22MaskDispatchCalls=0,gC22MaskDrawFlagsZero=0,gC22MaskExtAdjCalls=0,gC22MaskExtFloorCalls=0,gC22MaskBothExtCalls=0;
+    std::uint32_t gC22MaskMidTexCalls=0,gC22TransparentSuppressed=0;
+    // DF3DS_C3D23_LOWERVIS1_V1: frame-local classic lower visibility oracle + bounded run summary.
+    struct C23LowerFrameVis
+    {
+        const void* wallKey;
+        std::uint32_t columns,visibleColumns,emptyColumns,clampedColumns;
+    };
+    constexpr std::uint32_t kC23LowerFrameCapacity=64u;
+    C23LowerFrameVis gC23LowerFrame[kC23LowerFrameCapacity]{};
+    std::uint32_t gC23LowerFrameCount=0,gC23LowerFrameOverflow=0;
+
+    struct C23LowerWallSummary
+    {
+        const void* wallKey;
+        std::uint32_t draws,suppressed,partial,full,unknown,columns,visibleColumns,emptyColumns,clampedColumns;
+    };
+    constexpr std::uint32_t kC23LowerSummaryCapacity=64u;
+    C23LowerWallSummary gC23LowerSummary[kC23LowerSummaryCapacity]{};
+    std::uint32_t gC23LowerSummaryCount=0,gC23LowerSummaryOverflow=0;
+    std::uint32_t gC23LowerSuppressedDraws=0,gC23LowerPartialDraws=0,gC23LowerFullDraws=0,gC23LowerUnknownDraws=0;
+    std::uint32_t gC23LowerAuditColumns=0,gC23LowerVisibleColumns=0,gC23LowerEmptyColumns=0,gC23LowerClampedColumns=0;
+
+    // DF3DS_C3D28_COVERAGE1_V4: telemetry-only exact lower-strip submission coverage.
+    struct C28PendingLower
+    {
+        const void* wallKey;
+        std::int32_t xMin,xMax;
+        std::uint32_t columns,visibleColumns,emptyColumns,clampedColumns;
+        bool active;
+    };
+    struct C28SubmissionSample
+    {
+        const void* wallKey;
+        std::int32_t drawX0,drawX1,captureX0,captureX1;
+        std::uint32_t columns,visibleColumns,emptyColumns,clampedColumns;
+        std::int32_t rangeMatch;
+    };
+    constexpr std::uint32_t kC28PendingCapacity=64u,kC28SampleCapacity=64u;
+    C28PendingLower gC28Pending[kC28PendingCapacity]{};
+    C28SubmissionSample gC28Samples[kC28SampleCapacity]{};
+    std::uint32_t gC28SampleCount=0,gC28SampleOverflow=0;
+    std::uint32_t gC28LowerQueued=0,gC28Captured=0,gC28RangeMatch=0,gC28RangeMismatch=0,gC28Missing=0;
+    std::uint32_t gC28Columns=0,gC28VisibleColumns=0,gC28EmptyColumns=0,gC28ClampedColumns=0;
+
+    C28PendingLower* c28FindPending(const void* wallKey,bool create)
+    {
+        if(!wallKey)return nullptr;
+        for(std::uint32_t i=0;i<kC28PendingCapacity;++i)
+            if(gC28Pending[i].active&&gC28Pending[i].wallKey==wallKey)return &gC28Pending[i];
+        if(!create)return nullptr;
+        for(std::uint32_t i=0;i<kC28PendingCapacity;++i)
+        {
+            if(gC28Pending[i].active)continue;
+            gC28Pending[i]={};gC28Pending[i].wallKey=wallKey;gC28Pending[i].active=true;
+            return &gC28Pending[i];
+        }
+        return nullptr;
+    }
+
+    void c28ResetPending()
+    {
+        for(std::uint32_t i=0;i<kC28PendingCapacity;++i)gC28Pending[i]={};
+    }
+
+    void c28AuditLowerColumn(const void* wallKey,std::int32_t x,
+        std::int32_t rawTop,std::int32_t rawBottom,std::int32_t clippedTop,std::int32_t clippedBottom)
+    {
+        C28PendingLower* p=c28FindPending(wallKey,true);if(!p)return;
+        if(p->columns==0u){p->xMin=x;p->xMax=x;}else{p->xMin=std::min(p->xMin,x);p->xMax=std::max(p->xMax,x);}
+        ++p->columns;
+        if(clippedTop<=clippedBottom)++p->visibleColumns;else ++p->emptyColumns;
+        if(clippedTop!=rawTop||clippedBottom!=rawBottom)++p->clampedColumns;
+    }
+
+    void c28BindLowerSubmission(DrawWall& d)
+    {
+        d.c28CaptureX0=0;d.c28CaptureX1=-1;d.c28Columns=0;d.c28VisibleColumns=0;d.c28EmptyColumns=0;d.c28ClampedColumns=0;d.c28RangeMatch=0;
+        ++gC28LowerQueued;
+        C28PendingLower* p=c28FindPending(d.carrier.key,false);
+        if(!p){++gC28Missing;return;}
+        d.c28CaptureX0=p->xMin;d.c28CaptureX1=p->xMax;d.c28Columns=p->columns;d.c28VisibleColumns=p->visibleColumns;
+        d.c28EmptyColumns=p->emptyColumns;d.c28ClampedColumns=p->clampedColumns;
+        d.c28RangeMatch=(p->xMin==d.drawX0&&p->xMax==d.drawX1)?1:0;
+        ++gC28Captured;if(d.c28RangeMatch)++gC28RangeMatch;else ++gC28RangeMismatch;
+        gC28Columns+=p->columns;gC28VisibleColumns+=p->visibleColumns;gC28EmptyColumns+=p->emptyColumns;gC28ClampedColumns+=p->clampedColumns;
+        if(gC28SampleCount<kC28SampleCapacity)
+        {
+            gC28Samples[gC28SampleCount++]={d.carrier.key,d.drawX0,d.drawX1,p->xMin,p->xMax,p->columns,p->visibleColumns,p->emptyColumns,p->clampedColumns,d.c28RangeMatch};
+        }
+        else ++gC28SampleOverflow;
+        *p={};
+    }
+
+
+    // DF3DS_C3D33_EXTDEPTH1_V1: telemetry-only exterior-lower native overlap/depth fork.
+    struct C33ExtDepthSummary
+    {
+        const void* wallKey;
+        std::uint32_t draws,partial,full,emptyColumns,visibleColumns,clampedColumns;
+        std::uint32_t overlapTests,overlapWalls,closerOther,fartherOther,nearEqual,crossing;
+        std::int32_t minDepthDelta,maxDepthDelta;
+    };
+    constexpr std::uint32_t kC33Capacity=32u;
+    C33ExtDepthSummary gC33[kC33Capacity]{};
+    std::uint32_t gC33Count=0,gC33Overflow=0;
+
+    const C22MaskRouteSample* c33ExteriorRoute(const void* wallKey)
+    {
+        for(std::uint32_t i=0;i<gC22MaskRouteSampleCount;++i)
+        {
+            const C22MaskRouteSample& s=gC22MaskRouteSamples[i];
+            if(s.wallKey==wallKey&&(s.stage==31||s.stage==32)&&s.sectorExterior!=0)return &s;
+        }
+        return nullptr;
+    }
+
+    C33ExtDepthSummary* c33Summary(const void* wallKey)
+    {
+        for(std::uint32_t i=0;i<gC33Count;++i)if(gC33[i].wallKey==wallKey)return &gC33[i];
+        if(gC33Count>=kC33Capacity){++gC33Overflow;return nullptr;}
+        C33ExtDepthSummary& s=gC33[gC33Count++];s={};s.wallKey=wallKey;
+        s.minDepthDelta=0x7fffffff;s.maxDepthDelta=(-0x7fffffff-1);return &s;
+    }
+
+    bool c33DepthAtPixel(const DrawWall& d,std::int32_t px,double& outDepth)
+    {
+        if(d.focalLength==0)return false;
+        const Carrier& c=d.carrier;
+        const double ray=(double(px)*65536.0-double(d.projOffsetX))/double(d.focalLength);
+        const double dx=double(c.x1)-double(c.x0),dz=double(c.z1)-double(c.z0);
+        const double den=dx-ray*dz;
+        if(den>-0.000001&&den<0.000001)return false;
+        double t=(ray*double(c.z0)-double(c.x0))/den;
+        if(t<0.0)t=0.0;else if(t>1.0)t=1.0;
+        outDepth=double(c.z0)+dz*t;
+        return outDepth>0.0;
+    }
+
+    void c33AuditExteriorDepth()
+    {
+        for(std::uint32_t i=0;i<gDrawCount;++i)
+        {
+            const DrawWall& d=gDraws[i];
+            if(d.surfaceClass!=Surface_Lower||!c33ExteriorRoute(d.carrier.key))continue;
+            C33ExtDepthSummary* s=c33Summary(d.carrier.key);if(!s)continue;
+            ++s->draws;
+            if(d.c28Columns>0u)
+            {
+                s->emptyColumns+=d.c28EmptyColumns;s->visibleColumns+=d.c28VisibleColumns;s->clampedColumns+=d.c28ClampedColumns;
+                if(d.c28ClampedColumns>0u)++s->partial;else ++s->full;
+            }
+            const std::int32_t ax0=std::min(d.drawX0,d.drawX1),ax1=std::max(d.drawX0,d.drawX1);
+            for(std::uint32_t j=0;j<gDrawCount;++j)
+            {
+                if(i==j)continue;
+                const DrawWall& o=gDraws[j];
+                const std::int32_t bx0=std::min(o.drawX0,o.drawX1),bx1=std::max(o.drawX0,o.drawX1);
+                const std::int32_t lo=std::max(ax0,bx0),hi=std::min(ax1,bx1);
+                if(lo>hi)continue;
+                ++s->overlapTests;
+                const std::int32_t mid=lo+(hi-lo)/2;
+                double dzA=0.0,dzB=0.0;if(!c33DepthAtPixel(d,mid,dzA)||!c33DepthAtPixel(o,mid,dzB))continue;
+                ++s->overlapWalls;
+                const double delta=dzB-dzA; // negative: other native wall is closer.
+                const std::int32_t q=std::int32_t(delta/65536.0*1024.0);
+                s->minDepthDelta=std::min(s->minDepthDelta,q);s->maxDepthDelta=std::max(s->maxDepthDelta,q);
+                if(delta < -655.36)++s->closerOther;
+                else if(delta > 655.36)++s->fartherOther;
+                else ++s->nearEqual;
+
+                double a0=0.0,a1=0.0,b0=0.0,b1=0.0;
+                if(c33DepthAtPixel(d,lo,a0)&&c33DepthAtPixel(d,hi,a1)&&c33DepthAtPixel(o,lo,b0)&&c33DepthAtPixel(o,hi,b1))
+                {
+                    const double dl=b0-a0,dr=b1-a1;
+                    if((dl<0.0&&dr>0.0)||(dl>0.0&&dr<0.0))++s->crossing;
+                }
+            }
+        }
+    }
+
+
+    // DF3DS_C3D34_EXTFALLBACK1_V1: exact mismatch fallback telemetry.
+    std::uint32_t gC34ExteriorPartialFallbackDraws=0u;
+    std::uint64_t gC34ExteriorPartialFallbackEmptyColumns=0u;
+    std::uint64_t gC34ExteriorPartialFallbackVisibleColumns=0u;
+
+
+    // DF3DS_C3D35_NEARPLANE1_V1 — native wall camera-Z telemetry only.
+    struct C35Frame
+    {
+        std::uint64_t frame;
+        std::uint32_t walls,lower,extLower;
+        std::uint32_t cameraCross,nonPositive,near1,near4,near16,near64;
+        std::uint32_t extCameraCross,extNonPositive,extNear1,extNear4,extNear16,extNear64;
+        float minZ,maxZ,extMinZ,extMaxZ;
+    };
+    constexpr std::uint32_t kC35Ring=256u;
+    C35Frame gC35Frames[kC35Ring]{};
+    std::uint32_t gC35FrameWrite=0u,gC35FrameCount=0u;
+    std::uint64_t gC35TotalWalls=0u,gC35TotalExtLower=0u,gC35TotalCameraCross=0u,gC35TotalExtCameraCross=0u;
+    std::uint64_t gC35TotalNonPositive=0u,gC35TotalExtNonPositive=0u;
+    float gC35GlobalMinZ=1.0e30f,gC35GlobalMaxZ=-1.0e30f,gC35GlobalExtMinZ=1.0e30f,gC35GlobalExtMaxZ=-1.0e30f;
+
+    C35Frame* c35Frame()
+    {
+        if(gC35FrameCount>0u)
+        {
+            const std::uint32_t last=(gC35FrameWrite+kC35Ring-1u)%kC35Ring;
+            if(gC35Frames[last].frame==gFrameSerial)return &gC35Frames[last];
+        }
+        C35Frame& f=gC35Frames[gC35FrameWrite];
+        f={};f.frame=gFrameSerial;
+        f.minZ=1.0e30f;f.maxZ=-1.0e30f;f.extMinZ=1.0e30f;f.extMaxZ=-1.0e30f;
+        gC35FrameWrite=(gC35FrameWrite+1u)%kC35Ring;
+        if(gC35FrameCount<kC35Ring)++gC35FrameCount;
+        return &f;
+    }
+
+    inline void c35Bucket(float z0,float z1,std::uint32_t& cross,std::uint32_t& nonpos,
+        std::uint32_t& n1,std::uint32_t& n4,std::uint32_t& n16,std::uint32_t& n64)
+    {
+        const float mn=std::min(z0,z1);
+        if((z0<=0.0f&&z1>0.0f)||(z1<=0.0f&&z0>0.0f))++cross;
+        if(mn<=0.0f)++nonpos;
+        if(mn>0.0f&&mn<1.0f)++n1;
+        if(mn>0.0f&&mn<4.0f)++n4;
+        if(mn>0.0f&&mn<16.0f)++n16;
+        if(mn>0.0f&&mn<64.0f)++n64;
+    }
+
+    void c35AuditNativeWall(const DrawWall& d,float z0,float z1)
+    {
+        if(!std::isfinite(z0)||!std::isfinite(z1))return;
+        C35Frame* f=c35Frame();
+        ++f->walls;++gC35TotalWalls;
+        f->minZ=std::min(f->minZ,std::min(z0,z1));f->maxZ=std::max(f->maxZ,std::max(z0,z1));
+        gC35GlobalMinZ=std::min(gC35GlobalMinZ,std::min(z0,z1));gC35GlobalMaxZ=std::max(gC35GlobalMaxZ,std::max(z0,z1));
+        const std::uint32_t preCross=f->cameraCross,preNon=f->nonPositive;
+        c35Bucket(z0,z1,f->cameraCross,f->nonPositive,f->near1,f->near4,f->near16,f->near64);
+        gC35TotalCameraCross+=f->cameraCross-preCross;gC35TotalNonPositive+=f->nonPositive-preNon;
+        if(d.surfaceClass==Surface_Lower)++f->lower;
+
+        const C22MaskRouteSample* r=(d.surfaceClass==Surface_Lower)?c33ExteriorRoute(d.carrier.key):nullptr;
+        if(r)
+        {
+            ++f->extLower;++gC35TotalExtLower;
+            f->extMinZ=std::min(f->extMinZ,std::min(z0,z1));f->extMaxZ=std::max(f->extMaxZ,std::max(z0,z1));
+            gC35GlobalExtMinZ=std::min(gC35GlobalExtMinZ,std::min(z0,z1));gC35GlobalExtMaxZ=std::max(gC35GlobalExtMaxZ,std::max(z0,z1));
+            const std::uint32_t epreCross=f->extCameraCross,epreNon=f->extNonPositive;
+            c35Bucket(z0,z1,f->extCameraCross,f->extNonPositive,f->extNear1,f->extNear4,f->extNear16,f->extNear64);
+            gC35TotalExtCameraCross+=f->extCameraCross-epreCross;gC35TotalExtNonPositive+=f->extNonPositive-epreNon;
+        }
+    }
+
+
+    // DF3DS_C3D36_EMPTYTELEM1_V1: all-empty lower state is observation-only in this child.
+
+
+    void c38WriteProof(const char* phase)
+    {
+        FILE* f=nullptr /* C48 CLEAN1 disabled legacy diagnostic log */;
+        if(!f)return;
+        std::fprintf(f,
+            "DF3D C3D38 DEPTHREPLAY1 V1\n"
+            "marker=DF3DS_C3D38_DEPTHREPLAY1_V4\n"
+            "parent=DF3DS_C3D37_SENTINEL1_V1\n"
+            "phase=%s frame=%llu\n"
+            "replay=NATIVE_LOWER_WALLS_FINAL_PASS depth=OFF alpha=OFF texture=OFF geometry=UNCHANGED_EXISTING_WALL_VERTEX_ARRAYS\n",
+            phase?phase:"UNKNOWN",(unsigned long long)gFrameSerial);
+        std::fclose(f);
+    }
+
+    void c37WriteProof(const char* phase)
+    {
+        FILE* f=nullptr /* C48 CLEAN1 disabled legacy diagnostic log */;if(!f)return;
+        std::fprintf(f,"DF3D C3D38 DEPTHREPLAY1 V1\nmarker=DF3DS_C3D38_DEPTHREPLAY1_V4\nparent=DF3DS_C3D36_EMPTYTELEM1_V1\nphase=%s frame=%llu\nsentinel=UNCONDITIONAL_NATIVE_SCREENSPACE_CYAN_20PX_TOPLEFT_AFTER_WEAPON depth=OFF alpha=OFF texture=OFF\n",phase?phase:"UNKNOWN",(unsigned long long)gFrameSerial);
+        std::fclose(f);
+    }
+
+    void c36WriteProof(const char* phase)
+    {
+        FILE* f=nullptr /* C48 CLEAN1 disabled legacy diagnostic log */;
+        if(!f)return;
+        std::fprintf(f,
+            "DF3D C3D38 DEPTHREPLAY1 V1\n"
+            "marker=DF3DS_C3D38_DEPTHREPLAY1_V4\n"
+            "parent=DF3DS_C3D35_NEARPLANE1_V1\n"
+            "phase=%s frame=%llu\n"
+            "allEmptyObserved=%lu behavior=TELEMETRY_ONLY_NATIVE_LOWER_DRAW_PRESERVED owner=C23_ZERO_VISIBLE_LOWER_STATE_NO_LONGER_DRAW_VETO\n",
+            phase?phase:"UNKNOWN",
+            (unsigned long long)gFrameSerial,
+            (unsigned long)gC23LowerSuppressedDraws);
+        std::fclose(f);
+    }
+
+    void c35WriteProof(const char* phase)
+    {
+        FILE* f=nullptr /* C48 CLEAN1 disabled legacy diagnostic log */;
+        if(!f)return;
+        std::fprintf(f,
+            "DF3D C3D38 DEPTHREPLAY1 V1\nmarker=DF3DS_C3D38_DEPTHREPLAY1_V4\nparent=DF3DS_C3D34_EXTFALLBACK1_V1\n"
+            "phase=%s frame=%llu\n"
+            "totals walls=%llu extLower=%llu cameraCross=%llu nonPositive=%llu extCameraCross=%llu extNonPositive=%llu "
+            "minZ=%.6f maxZ=%.6f extMinZ=%.6f extMaxZ=%.6f owner=ACTUAL_NATIVE_WALL_CAMERA_Z_IMMEDIATELY_BEFORE_WRITEVERTEX\n",
+            phase?phase:"UNKNOWN",(unsigned long long)gFrameSerial,
+            (unsigned long long)gC35TotalWalls,(unsigned long long)gC35TotalExtLower,
+            (unsigned long long)gC35TotalCameraCross,(unsigned long long)gC35TotalNonPositive,
+            (unsigned long long)gC35TotalExtCameraCross,(unsigned long long)gC35TotalExtNonPositive,
+            gC35GlobalMinZ==1.0e30f?0.0f:gC35GlobalMinZ,gC35GlobalMaxZ==-1.0e30f?0.0f:gC35GlobalMaxZ,
+            gC35GlobalExtMinZ==1.0e30f?0.0f:gC35GlobalExtMinZ,gC35GlobalExtMaxZ==-1.0e30f?0.0f:gC35GlobalExtMaxZ);
+
+        const std::uint32_t start=(gC35FrameCount<kC35Ring)?0u:gC35FrameWrite;
+        for(std::uint32_t n=0;n<gC35FrameCount;++n)
+        {
+            const C35Frame& s=gC35Frames[(start+n)%kC35Ring];
+            std::fprintf(f,
+                "frame[%lu] serial=%llu walls=%lu lower=%lu extLower=%lu minZ=%.6f maxZ=%.6f "
+                "cross=%lu nonpos=%lu near1=%lu near4=%lu near16=%lu near64=%lu "
+                "extMinZ=%.6f extMaxZ=%.6f extCross=%lu extNonpos=%lu extNear1=%lu extNear4=%lu extNear16=%lu extNear64=%lu\n",
+                (unsigned long)n,(unsigned long long)s.frame,(unsigned long)s.walls,(unsigned long)s.lower,(unsigned long)s.extLower,
+                s.minZ==1.0e30f?0.0f:s.minZ,s.maxZ==-1.0e30f?0.0f:s.maxZ,
+                (unsigned long)s.cameraCross,(unsigned long)s.nonPositive,(unsigned long)s.near1,(unsigned long)s.near4,
+                (unsigned long)s.near16,(unsigned long)s.near64,
+                s.extMinZ==1.0e30f?0.0f:s.extMinZ,s.extMaxZ==-1.0e30f?0.0f:s.extMaxZ,
+                (unsigned long)s.extCameraCross,(unsigned long)s.extNonPositive,(unsigned long)s.extNear1,(unsigned long)s.extNear4,
+                (unsigned long)s.extNear16,(unsigned long)s.extNear64);
+        }
+        std::fclose(f);
+    }
+
+    void c34WriteProof(const char* phase)
+    {
+        FILE* f=nullptr /* C48 CLEAN1 disabled legacy diagnostic log */;
+        if(!f)return;
+        std::fprintf(f,
+            "DF3D C3D38 DEPTHREPLAY1 V1\n"
+            "marker=DF3DS_C3D38_DEPTHREPLAY1_V4\n"
+            "parent=DF3DS_C3D33_EXTDEPTH1_V1\n"
+            "phase=%s frame=%llu\n"
+            "fallback draws=%lu emptyColumns=%llu visibleColumns=%llu owner=EXTERIOR_LOWER_CLASSIC_EMPTY_COLUMN_FULL_NATIVE_RECT_MISMATCH_SOFTWARE_UNDERLAY_FALLBACK\n",
+            phase?phase:"UNKNOWN",
+            (unsigned long long)gFrameSerial,
+            (unsigned long)gC34ExteriorPartialFallbackDraws,
+            (unsigned long long)gC34ExteriorPartialFallbackEmptyColumns,
+            (unsigned long long)gC34ExteriorPartialFallbackVisibleColumns);
+        std::fclose(f);
+    }
+
+    void c33WriteProof(const char* phase)
+    {
+        FILE* f=nullptr /* C48 CLEAN1 disabled legacy diagnostic log */;if(!f)return;
+        std::fprintf(f,"DF3D C3D38 DEPTHREPLAY1 V1\nmarker=DF3DS_C3D38_DEPTHREPLAY1_V4\nparent=DF3DS_C3D32_EXTOWNER1_V3\nphase=%s frame=%llu\n",
+            phase?phase:"UNKNOWN",(unsigned long long)gFrameSerial);
+        std::fprintf(f,"extDepth owners=%lu overflow=%lu owner=DIRECT_C32_EXTERIOR_LOWER_NATIVE_WALL_DEPTH_OVERLAP_TELEMETRY_ONLY\n",
+            (unsigned long)gC33Count,(unsigned long)gC33Overflow);
+        for(std::uint32_t i=0;i<gC33Count;++i)
+        {
+            const C33ExtDepthSummary& s=gC33[i];const C22MaskRouteSample* r=c33ExteriorRoute(s.wallKey);
+            std::fprintf(f,"extDepth[%lu] wall=%p sectorExt=%ld nextExtAdj=%ld stage=%ld draws=%lu partial=%lu full=%lu visible=%lu empty=%lu clamped=%lu overlapTests=%lu overlapWalls=%lu closerOther=%lu fartherOther=%lu nearEqual=%lu crossing=%lu minDQ=%ld maxDQ=%ld\n",
+                (unsigned long)i,s.wallKey,r?(long)r->sectorExterior:-1L,r?(long)r->nextExtAdj:-1L,r?(long)r->stage:-1L,
+                (unsigned long)s.draws,(unsigned long)s.partial,(unsigned long)s.full,(unsigned long)s.visibleColumns,(unsigned long)s.emptyColumns,(unsigned long)s.clampedColumns,
+                (unsigned long)s.overlapTests,(unsigned long)s.overlapWalls,(unsigned long)s.closerOther,(unsigned long)s.fartherOther,(unsigned long)s.nearEqual,(unsigned long)s.crossing,
+                (long)(s.minDepthDelta==0x7fffffff?0:s.minDepthDelta),(long)(s.maxDepthDelta==(-0x7fffffff-1)?0:s.maxDepthDelta));
+        }
+        std::fclose(f);
+    }
+
+    void c28WriteCoverageProof(const char* phase)
+    {
+        FILE* f=nullptr /* C48 CLEAN1 disabled legacy diagnostic log */;if(!f)return;
+        std::fprintf(f,"DF3D C3D38 DEPTHREPLAY1 V1\nmarker=DF3DS_C3D38_DEPTHREPLAY1_V4\nparent=DF3DS_C3D27_MIRRORPAIR1_V4\nphase=%s frame=%llu\n",
+            phase?phase:"UNKNOWN",(unsigned long long)gFrameSerial);
+        std::fprintf(f,"coverage lowerQueued=%lu captured=%lu rangeMatch=%lu rangeMismatch=%lu missing=%lu columns=%lu visible=%lu empty=%lu clamped=%lu samples=%lu sampleOverflow=%lu owner=EXACT_CLASSIC_POSTCLAMP_TO_NATIVE_LOWER_SUBMISSION_TELEMETRY_ONLY\n",
+            (unsigned long)gC28LowerQueued,(unsigned long)gC28Captured,(unsigned long)gC28RangeMatch,(unsigned long)gC28RangeMismatch,(unsigned long)gC28Missing,
+            (unsigned long)gC28Columns,(unsigned long)gC28VisibleColumns,(unsigned long)gC28EmptyColumns,(unsigned long)gC28ClampedColumns,
+            (unsigned long)gC28SampleCount,(unsigned long)gC28SampleOverflow);
+        for(std::uint32_t i=0;i<gC28SampleCount;++i)
+        {
+            const C28SubmissionSample& s=gC28Samples[i];
+            std::fprintf(f,"coverage[%lu] wall=%p draw=(%ld,%ld) capture=(%ld,%ld) columns=%lu visible=%lu empty=%lu clamped=%lu rangeMatch=%ld\n",
+                (unsigned long)i,s.wallKey,(long)s.drawX0,(long)s.drawX1,(long)s.captureX0,(long)s.captureX1,
+                (unsigned long)s.columns,(unsigned long)s.visibleColumns,(unsigned long)s.emptyColumns,(unsigned long)s.clampedColumns,(long)s.rangeMatch);
+        }
+        std::fclose(f);
+    }
+
+    C23LowerFrameVis* c23FindLowerFrame(const void* wallKey,bool create)
+    {
+        if(!wallKey)return nullptr;
+        for(std::uint32_t i=0;i<gC23LowerFrameCount;++i)if(gC23LowerFrame[i].wallKey==wallKey)return &gC23LowerFrame[i];
+        if(!create)return nullptr;
+        if(gC23LowerFrameCount>=kC23LowerFrameCapacity){++gC23LowerFrameOverflow;return nullptr;}
+        C23LowerFrameVis& v=gC23LowerFrame[gC23LowerFrameCount++];v={wallKey,0u,0u,0u,0u};return &v;
+    }
+    void c23ResetLowerFrame()
+    {
+        gC23LowerFrameCount=0;
+        for(std::uint32_t i=0;i<kC23LowerFrameCapacity;++i)gC23LowerFrame[i]={};
+    }
+    void c23RecordLowerOutcome(const void* wallKey,const C23LowerFrameVis* v,std::int32_t outcome)
+    {
+        C23LowerWallSummary* s=nullptr;
+        for(std::uint32_t i=0;i<gC23LowerSummaryCount;++i)if(gC23LowerSummary[i].wallKey==wallKey){s=&gC23LowerSummary[i];break;}
+        if(!s)
+        {
+            if(gC23LowerSummaryCount>=kC23LowerSummaryCapacity){++gC23LowerSummaryOverflow;return;}
+            s=&gC23LowerSummary[gC23LowerSummaryCount++];*s={};s->wallKey=wallKey;
+        }
+        ++s->draws;
+        if(outcome==0)++s->suppressed;else if(outcome==1)++s->partial;else if(outcome==2)++s->full;else ++s->unknown;
+        if(v){s->columns+=v->columns;s->visibleColumns+=v->visibleColumns;s->emptyColumns+=v->emptyColumns;s->clampedColumns+=v->clampedColumns;}
+    }
+    constexpr std::uint32_t kFlatEdgeCapacity=8192u;
+    FlatEdge gFlatEdges[kFlatEdgeCapacity]{}; std::uint32_t gFlatEdgeCount=0;
+    FlatSectorBuild gFlatBuilds[kFlatSectorCapacity]{};
+    std::uint32_t gFlatEdgesCaptured=0,gFlatLoopsBuilt=0,gFlatLoopFail=0,gFlatTopologyFinalized=0; std::uint32_t gFlatBeginReject=0,gFlatEdgeReject=0,gFlatFinishMissing=0;
+    std::uint32_t gSummaryFlatEdgesCaptured=0,gSummaryFlatLoopsBuilt=0,gSummaryFlatLoopFail=0,gSummaryFlatTopologyFinalized=0;
+    std::uint32_t gSummaryWeaponBlits=0,gSummaryWeaponScaled=0,gSummaryWeaponLit=0,gSummaryWeaponSubmittedCount=0;
+
+
+    bool c19RayWallT(const DrawWall& d,std::int32_t pixelBoundary,double& outT)
+    {
+        const Carrier& c=d.carrier;
+        if(d.focalLength==0) return false;
+        const double ray=(double(pixelBoundary)*65536.0-double(d.projOffsetX))/double(d.focalLength);
+        const double dx=double(c.x1)-double(c.x0),dz=double(c.z1)-double(c.z0);
+        const double den=dx-ray*dz;
+        if(std::fabs(den)<1.0e-12) return false;
+        const double t=(ray*double(c.z0)-double(c.x0))/den;
+        if(!std::isfinite(t)) return false;
+        outT=std::max(0.0,std::min(1.0,t));
+        return true;
+    }
+
+    bool c19ClassicWallWindow(const DrawWall& d,double& outT0,double& outT1,bool& clippedLeft,bool& clippedRight)
+    {
+        const Carrier& c=d.carrier;
+        if(d.drawX0>d.drawX1) return false;
+        // wall_process stores right as round(projectedRight)-1, so +1 reconstructs the right-exclusive boundary.
+        clippedLeft=d.drawX0>c.projectedX0;
+        clippedRight=d.drawX1<c.projectedX1;
+        outT0=0.0;outT1=1.0;
+        if(clippedLeft && !c19RayWallT(d,d.drawX0,outT0)) return false;
+        if(clippedRight)
+        {
+            if(d.drawX1==0x7fffffff) return false;
+            if(!c19RayWallT(d,d.drawX1+1,outT1)) return false;
+        }
+        outT0=std::max(0.0,std::min(1.0,outT0));
+        outT1=std::max(0.0,std::min(1.0,outT1));
+        return outT1>outT0+1.0e-9;
+    }
+
+    void c20WriteIdentityOnce()
+    {
+        if(gC20IdentityWritten) return;
+        gC20IdentityWritten=true;
+        FILE* f=nullptr /* C48 CLEAN1 disabled legacy diagnostic log */;
+        if(!f) return;
+        std::fprintf(f,"DF3D C3D38 DEPTHREPLAY1 V1\nmarker=DF3DS_C3D38_DEPTHREPLAY1_V4\nparent=DF3DS_C3D27_MIRRORPAIR1_V4\nphase=FIRST_FRAME\n");
+        std::fclose(f);
+    }
+
+    inline float fixedToFloat(std::int32_t v) { return static_cast<float>(v)*kInvFixed; }
+    inline std::int32_t iabs(std::int32_t v) { return v < 0 ? -v : v; }
+    Carrier* findCarrier(const void* key)
+    {
+        for (std::uint32_t i=0;i<gCarrierCount;++i) if (gCarriers[i].key==key) return &gCarriers[i];
+        return nullptr;
+    }
+
+    namespace TFE_RenderBackendBridge { }
+    inline unsigned morton8(unsigned x,unsigned y)
+    {
+        static const unsigned char mx[8]={0,1,4,5,16,17,20,21}; static const unsigned char my[8]={0,2,8,10,32,34,40,42};
+        return unsigned(mx[x&7u])+unsigned(my[y&7u]);
+    }
+    inline std::size_t tiledOffset(unsigned width,unsigned x,unsigned y)
+    {
+        return ((std::size_t(y>>3)*(width/8u)+(x>>3))*64u)+morton8(x,y);
+    }
+    inline bool pow2(unsigned v) { return v>=8u && v<=1024u && (v&(v-1u))==0u; }
+    inline unsigned nextPow2(unsigned v) { unsigned p=8u; while (p<v && p<1024u) p<<=1u; return p; }
+    MaterialView makeMaterial(const void* key,const void* image,std::int32_t w,std::int32_t h,std::int32_t logY,std::int32_t pal,std::int32_t ox,std::int32_t oz,std::int32_t th,std::int32_t flip)
+    { return {key,static_cast<const std::uint8_t*>(image),w,h,logY,pal,ox,oz,th,flip}; }
+    bool validMaterial(const MaterialView& m) { return m.key && m.image && m.width>0 && m.height>0 && m.width<=1024 && m.height<=1024; }
+    WallMaterialSet* findWallMaterials(const void* key)
+    {
+        for (std::uint32_t i=0;i<gWallMaterialCount;++i) if (gWallMaterials[i].wallKey==key) return &gWallMaterials[i]; return nullptr;
+    }
+    const MaterialView* wallMaterial(const DrawWall& d)
+    {
+        WallMaterialSet* s=findWallMaterials(d.carrier.key); if (!s) return nullptr;
+        return d.surfaceClass==Surface_Upper?&s->upper:d.surfaceClass==Surface_Lower?&s->lower:&s->solid;
+    }
+    void purgeTextures()
+    {
+        for (std::uint32_t i=0;i<kTextureCacheCapacity;++i) if (gTextureCache[i].active) { C3D_TexDelete(&gTextureCache[i].tex); gTextureCache[i]={}; }
+    }
+    void purgeWeaponNativeTextures(); // DF3DS_C3D13_VISFIX1_V4 forward declaration for syncPalette
+
+    std::uint64_t hashPalette(const u16* p)
+    {
+        if (!p) return 0; std::uint64_t h=1469598103934665603ull; for (int i=0;i<256;++i) { h^=p[i]&255u; h*=1099511628211ull; h^=(p[i]>>8)&255u; h*=1099511628211ull; } return h;
+    }
+    bool syncPalette()
+    {
+        const u16* p=TFE_RenderBackend::df3dsC3D8Palette565(); if (!p) return false; const std::uint64_t h=hashPalette(p);
+        if (h!=gPaletteHash) { if (gPaletteHash) { purgeTextures(); purgeWeaponNativeTextures(); } gPaletteHash=h; ++gPaletteReloads; } return true;
+    }
+    NativeTexture* acquireTexture(const MaterialView& m,bool alpha,const std::uint8_t* light=nullptr)
+    {
+        if (!validMaterial(m) || !syncPalette()) { ++gTextureUploadFail; return nullptr; }
+        for (std::uint32_t i=0;i<kTextureCacheCapacity;++i) if (gTextureCache[i].active && gTextureCache[i].key==m.key && gTextureCache[i].alpha==alpha && gTextureCache[i].lightKey==static_cast<const void*>(light)) return &gTextureCache[i];
+        std::uint32_t slot=kTextureCacheCapacity;
+        for (std::uint32_t i=0;i<kTextureCacheCapacity;++i) if (!gTextureCache[i].active) { slot=i; break; }
+        if (slot==kTextureCacheCapacity) { slot=gTextureEvictCursor++%kTextureCacheCapacity; C3D_TexDelete(&gTextureCache[slot].tex); gTextureCache[slot]={}; ++gTextureEvicts; }
+        NativeTexture& n=gTextureCache[slot]; const unsigned sw=unsigned(m.width),sh=unsigned(m.height); unsigned gw=pow2(sw)?sw:nextPow2(sw),gh=pow2(sh)?sh:nextPow2(sh); const std::size_t sourceColumnStride=(m.logSizeY>0&&m.logSizeY<31)?(std::size_t(1)<<static_cast<unsigned>(m.logSizeY)):std::size_t(sh);
+        if (gw<sw||gh<sh||gw>1024u||gh>1024u||!C3D_TexInit(&n.tex,gw,gh,alpha?GPU_RGBA8:GPU_RGB565)) { n={}; ++gTextureUploadFail; return nullptr; }
+        n.active=true;n.alpha=alpha;n.key=m.key;n.lightKey=static_cast<const void*>(light);n.sourceW=sw;n.sourceH=sh;n.gpuW=gw;n.gpuH=gh; C3D_TexSetFilter(&n.tex,GPU_NEAREST,GPU_NEAREST); C3D_TexSetWrap(&n.tex,(gw==sw)?GPU_REPEAT:GPU_CLAMP_TO_EDGE,(gh==sh)?GPU_REPEAT:GPU_CLAMP_TO_EDGE);
+        const u16* pal=TFE_RenderBackend::df3dsC3D8Palette565();
+        if (alpha)
+        {
+            std::uint32_t* dst=static_cast<std::uint32_t*>(n.tex.data); for (unsigned y=0;y<gh;++y) for (unsigned x=0;x<gw;++x) { std::uint32_t rgba=0; if (x<sw&&y<sh) { const std::size_t si=(m.logSizeY==0)?(std::size_t(y)*sw+x):(std::size_t(x)*sourceColumnStride+y); const std::uint8_t idx=m.image[si]; const std::uint8_t mapped=(idx&&light)?light[idx]:idx; const u16 c=pal[mapped]; const unsigned r=((c>>11)&31u)*255u/31u,g=((c>>5)&63u)*255u/63u,b=(c&31u)*255u/31u,a=idx?255u:0u; rgba=(r<<24)|(g<<16)|(b<<8)|a; } dst[tiledOffset(gw,x,y)]=rgba; }
+        }
+        else
+        {
+            u16* dst=static_cast<u16*>(n.tex.data); for (unsigned y=0;y<gh;++y) for (unsigned x=0;x<gw;++x) { u16 c=0; if (x<sw&&y<sh) { const std::size_t si=(m.logSizeY==0)?(std::size_t(y)*sw+x):(std::size_t(x)*sourceColumnStride+y); c=pal[m.image[si]]; } dst[tiledOffset(gw,x,y)]=c; }
+        }
+        GSPGPU_FlushDataCache(n.tex.data,n.tex.size); C3D_TexBind(0,&n.tex); ++gTextureUploads; return &n;
+    }
+    // DF3DS_C3D13_VISFIX1_V4: weapon ScreenImage upload follows canonical software blit source addressing,
+    // while Morton 8x8 remains purely the Citro3D destination layout.
+    static constexpr std::uint32_t kWeaponNativeCacheCapacity=16u;
+    static constexpr std::int32_t kWeaponSourceLayout=1; // COLUMN_MAJOR_HEIGHT_STRIDE
+    NativeTexture gWeaponNativeCache[kWeaponNativeCacheCapacity]{};
+    std::uint32_t gWeaponNativeEvictCursor=0,gWeaponNativeUploads=0,gWeaponNativeEvicts=0;
+
+    void purgeWeaponNativeTextures()
+    {
+        for(std::uint32_t i=0;i<kWeaponNativeCacheCapacity;++i)
+        {
+            if(gWeaponNativeCache[i].active) C3D_TexDelete(&gWeaponNativeCache[i].tex);
+            gWeaponNativeCache[i]={};
+        }
+    }
+
+    inline std::size_t weaponSourceIndex(const MaterialView& m,unsigned x,unsigned y)
+    {
+        if(kWeaponSourceLayout==0) return std::size_t(y)*std::size_t(m.width)+std::size_t(x);
+        if(kWeaponSourceLayout==1) return std::size_t(x)*std::size_t(m.height)+std::size_t(y);
+        const std::size_t stride=(m.logSizeY>0&&m.logSizeY<31)?(std::size_t(1)<<static_cast<unsigned>(m.logSizeY)):std::size_t(m.height);
+        return std::size_t(x)*stride+std::size_t(y);
+    }
+
+    NativeTexture* acquireWeaponTexture(const WeaponLayer& w)
+    {
+        const MaterialView& m=w.material;const std::uint8_t* light=w.light;
+        if(!validMaterial(m)||!syncPalette()){++gTextureUploadFail;return nullptr;}
+        for(std::uint32_t i=0;i<kWeaponNativeCacheCapacity;++i)
+            if(gWeaponNativeCache[i].active&&gWeaponNativeCache[i].key==m.key&&gWeaponNativeCache[i].lightKey==static_cast<const void*>(light)) return &gWeaponNativeCache[i];
+        std::uint32_t slot=kWeaponNativeCacheCapacity;for(std::uint32_t i=0;i<kWeaponNativeCacheCapacity;++i)if(!gWeaponNativeCache[i].active){slot=i;break;}
+        if(slot==kWeaponNativeCacheCapacity){slot=gWeaponNativeEvictCursor++%kWeaponNativeCacheCapacity;C3D_TexDelete(&gWeaponNativeCache[slot].tex);gWeaponNativeCache[slot]={};++gWeaponNativeEvicts;}
+        NativeTexture& n=gWeaponNativeCache[slot];const unsigned sw=unsigned(m.width),sh=unsigned(m.height);unsigned gw=pow2(sw)?sw:nextPow2(sw),gh=pow2(sh)?sh:nextPow2(sh);
+        if(gw<sw||gh<sh||gw>1024u||gh>1024u||!C3D_TexInit(&n.tex,gw,gh,GPU_RGBA8)){n={};++gTextureUploadFail;return nullptr;}
+        n.active=true;n.alpha=true;n.key=m.key;n.lightKey=static_cast<const void*>(light);n.sourceW=sw;n.sourceH=sh;n.gpuW=gw;n.gpuH=gh;C3D_TexSetFilter(&n.tex,GPU_NEAREST,GPU_NEAREST);C3D_TexSetWrap(&n.tex,GPU_CLAMP_TO_EDGE,GPU_CLAMP_TO_EDGE);
+        const u16* pal=TFE_RenderBackend::df3dsC3D8Palette565();std::uint32_t* dst=static_cast<std::uint32_t*>(n.tex.data);
+        for(unsigned y=0;y<gh;++y)for(unsigned x=0;x<gw;++x)
+        {
+            std::uint32_t rgba=0;if(x<sw&&y<sh){const std::uint8_t idx=m.image[weaponSourceIndex(m,x,y)];const std::uint8_t mapped=(idx&&light)?light[idx]:idx;const u16 c=pal[mapped];const unsigned r=((c>>11)&31u)*255u/31u,g=((c>>5)&63u)*255u/63u,b=(c&31u)*255u/31u,a=idx?255u:0u;rgba=(r<<24)|(g<<16)|(b<<8)|a;}
+            dst[tiledOffset(gw,x,y)]=rgba;
+        }
+        GSPGPU_FlushDataCache(n.tex.data,n.tex.size);++gWeaponNativeUploads;return &n;
+    }
+
+
+    // DF3DS_C3D10_NATIVEPLANES1_V2: texture ownership stays exact WaxCell + light row.
+    // The upload path deliberately reuses C3D8 tiledOffset(), i.e. 8x8 Morton swizzle.
+    void purgeSpriteTextures()
+    {
+        for (std::uint32_t i=0;i<kSpriteTextureCapacity;++i)
+        {
+            if (gSpriteTextures[i].active) C3D_TexDelete(&gSpriteTextures[i].tex);
+            gSpriteTextures[i]={};
+        }
+    }
+    void spriteDecodeColumnExact(const std::uint8_t* colData,std::uint8_t* out,std::int32_t height)
+    {
+        for (std::int32_t y=0;y<height;)
+        {
+            std::uint8_t count=*colData++;
+            if (count&0x80u)
+            {
+                count&=0x7fu;
+                for (std::int32_t r=0;r<count && y<height;++r,++y) out[y]=0;
+            }
+            else
+            {
+                for (std::int32_t r=0;r<count && y<height;++r,++y,++colData) out[y]=*colData;
+            }
+        }
+    }
+    SpriteNativeTexture* acquireSpriteTexture(const SpriteLayer& s)
+    {
+        if (!s.cellKey||!s.cell||!s.columnOffset||!s.image||s.width<=0||s.height<=0||s.width>1024||s.height>1024) { ++gSpriteTexBlocked; return nullptr; }
+        if (!syncPalette()) { ++gSpriteTexBlocked; return nullptr; }
+        if (gSpritePaletteSeen!=std::uint64_t(gPaletteReloads)) { purgeSpriteTextures(); gSpritePaletteSeen=gPaletteReloads; }
+        for (std::uint32_t i=0;i<kSpriteTextureCapacity;++i)
+        {
+            SpriteNativeTexture& n=gSpriteTextures[i];
+            if (n.active&&n.cellKey==s.cellKey&&n.lightKey==static_cast<const void*>(s.light)) { n.frameSerial=gFrameSerial; ++gSpriteTexHits; return &n; }
+        }
+        ++gSpriteTexMiss;
+        std::uint32_t slot=kSpriteTextureCapacity;
+        for (std::uint32_t i=0;i<kSpriteTextureCapacity;++i) if (!gSpriteTextures[i].active) { slot=i; break; }
+        if (slot==kSpriteTextureCapacity)
+        {
+            for (std::uint32_t n=0;n<kSpriteTextureCapacity;++n)
+            {
+                const std::uint32_t i=(gSpriteTextureEvictCursor+n)%kSpriteTextureCapacity;
+                if (gSpriteTextures[i].frameSerial!=gFrameSerial) { slot=i; gSpriteTextureEvictCursor=(i+1u)%kSpriteTextureCapacity; break; }
+            }
+        }
+        if (slot==kSpriteTextureCapacity) { ++gSpriteTexBlocked; return nullptr; }
+        SpriteNativeTexture& n=gSpriteTextures[slot];
+        if (n.active) { C3D_TexDelete(&n.tex); n={}; ++gSpriteTexEvicts; }
+        const unsigned sw=unsigned(s.width),sh=unsigned(s.height),gw=pow2(sw)?sw:nextPow2(sw),gh=pow2(sh)?sh:nextPow2(sh);
+        if (gw<sw||gh<sh||gw>1024u||gh>1024u||!C3D_TexInit(&n.tex,gw,gh,GPU_RGBA8)) { n={}; ++gSpriteTexBlocked; return nullptr; }
+        n.active=true;n.cellKey=s.cellKey;n.lightKey=static_cast<const void*>(s.light);n.sourceW=sw;n.sourceH=sh;n.gpuW=gw;n.gpuH=gh;n.frameSerial=gFrameSerial;
+        C3D_TexSetFilter(&n.tex,GPU_NEAREST,GPU_NEAREST);C3D_TexSetWrap(&n.tex,GPU_CLAMP_TO_EDGE,GPU_CLAMP_TO_EDGE);
+        const u16* pal=TFE_RenderBackend::df3dsC3D8Palette565();std::uint32_t* dst=static_cast<std::uint32_t*>(n.tex.data);
+        for (unsigned x=0;x<sw;++x)
+        {
+            const std::uint8_t* col=nullptr;
+            if (s.compressed)
+            {
+                col=s.cell+s.columnOffset[x];spriteDecodeColumnExact(col,gSpriteDecodeColumn,s.height);col=gSpriteDecodeColumn;
+            }
+            else col=s.image+s.columnOffset[x];
+            for (unsigned gy=0;gy<sh;++gy)
+            {
+                // DF3DS_C3D11_TAKEOVERFIX1_V2: WaxCell row 0 is native billboard top; Morton swizzle is destination layout only.
+                const std::uint8_t src=col[gy];const std::uint8_t lit=(src&&s.light)?s.light[src]:src;const u16 c=pal[lit];
+                const unsigned r=((c>>11)&31u)*255u/31u,g=((c>>5)&63u)*255u/63u,b=(c&31u)*255u/31u,a=src?255u:0u;
+                dst[tiledOffset(gw,x,gy)]=(r<<24)|(g<<16)|(b<<8)|a;
+            }
+        }
+        for (unsigned y=sh;y<gh;++y) for (unsigned x=0;x<gw;++x) dst[tiledOffset(gw,x,y)]=0;
+        for (unsigned y=0;y<sh;++y) for (unsigned x=sw;x<gw;++x) dst[tiledOffset(gw,x,y)]=0;
+        GSPGPU_FlushDataCache(n.tex.data,n.tex.size);++gSpriteTexUploads;return &n;
+    }
+    // DF3DS_C3D14_SPRITEV1_V3: bounded runtime census. No traversal, selection, material, or animation ownership is changed.
+    constexpr std::uint32_t kC14AnimStateCapacity=64u,kC14AnimEventCapacity=96u;
+    constexpr std::uint32_t kC14SectorStateCapacity=64u,kC14SectorEventCapacity=48u;
+    constexpr std::uint32_t kC14SurfaceCapacity=48u,kC14ModelCapacity=24u;
+    struct C14AnimState { const void* objKey; const void* frameKey; const void* cellKey; std::int32_t kind,width,height,compressed,flip; std::uint32_t submissions,transitions; bool active; };
+    struct C14AnimEvent { const void* objKey; const void* frameKey; const void* cellKey; std::uint64_t frameSerial; std::int32_t kind,width,height,compressed,flip; };
+    struct C14SectorState { const void* key; std::uint64_t hash; std::int32_t floorHeight,ceilingHeight,vertexCount; std::uint32_t observations,changes; bool active; };
+    struct C14SectorEvent { const void* key; std::uint64_t frameSerial,hash; std::int32_t floorHeight,ceilingHeight,vertexCount; };
+    struct C14SurfaceState { const void* ownerKey; const void* textureKey; const void* auxKey; std::int32_t x,z; std::uint32_t flags,calls; bool active; };
+    struct C14ModelState { const void* objectKey; const void* modelKey; std::int32_t x,y,z; std::uint32_t calls; bool active; };
+    struct C14FixedXZ { std::int32_t x,z; };
+    C14AnimState gC14AnimStates[kC14AnimStateCapacity]{}; C14AnimEvent gC14AnimEvents[kC14AnimEventCapacity]{};
+    C14SectorState gC14SectorStates[kC14SectorStateCapacity]{}; C14SectorEvent gC14SectorEvents[kC14SectorEventCapacity]{};
+    C14SurfaceState gC14Signs[kC14SurfaceCapacity]{},gC14Masks[kC14SurfaceCapacity]{}; C14ModelState gC14Models[kC14ModelCapacity]{};
+    std::uint32_t gC14AnimStateCount=0,gC14AnimEventCount=0,gC14AnimTransitions=0,gC14AnimOverflow=0;
+    std::uint32_t gC14SectorStateCount=0,gC14SectorEventCount=0,gC14SectorChanges=0,gC14SectorOverflow=0;
+    std::uint32_t gC14SignCount=0,gC14SignCalls=0,gC14SignOverflow=0,gC14MaskCount=0,gC14MaskCalls=0,gC14MaskOverflow=0;
+    std::uint32_t gC14ModelCount=0,gC14ModelCalls=0,gC14ModelOverflow=0;
+
+    C18SignLayer* c18FindFrameSign(const void* wallKey)
+    {
+        for(std::uint32_t i=0;i<gC18SignLayerCount;++i) if(gC18SignLayers[i].wallKey==wallKey) return &gC18SignLayers[i];
+        return nullptr;
+    }
+    void c18TrackSignState(const void* wallKey,const void* textureKey)
+    {
+        C18SignState* s=nullptr;
+        for(std::uint32_t i=0;i<gC18SignStateCount;++i) if(gC18SignStates[i].wallKey==wallKey){s=&gC18SignStates[i];break;}
+        if(!s)
+        {
+            if(gC18SignStateCount>=kC18SignStateCapacity){++gC18SignStateOverflow;return;}
+            s=&gC18SignStates[gC18SignStateCount++];s->wallKey=wallKey;s->textureKey=textureKey;s->active=true;return;
+        }
+        if(s->textureKey!=textureKey){s->textureKey=textureKey;++gC18SignStateChanges;}
+    }
+
+    void c14AuditSpriteFrame(const void* objKey,const void* frameKey,const void* cellKey,std::int32_t kind,std::int32_t width,std::int32_t height,std::int32_t compressed,std::int32_t flip)
+    {
+        if(!objKey||!cellKey) return;
+        C14AnimState* s=nullptr;
+        for(std::uint32_t i=0;i<gC14AnimStateCount;++i)if(gC14AnimStates[i].objKey==objKey){s=&gC14AnimStates[i];break;}
+        bool changed=false;
+        if(!s){if(gC14AnimStateCount>=kC14AnimStateCapacity){++gC14AnimOverflow;return;}s=&gC14AnimStates[gC14AnimStateCount++];*s={};s->active=true;s->objKey=objKey;changed=true;}
+        else changed=(s->frameKey!=frameKey)||(s->cellKey!=cellKey);
+        ++s->submissions;if(changed&&s->submissions>1u){++s->transitions;++gC14AnimTransitions;}
+        s->frameKey=frameKey;s->cellKey=cellKey;s->kind=kind;s->width=width;s->height=height;s->compressed=compressed;s->flip=flip;
+        if(changed){if(gC14AnimEventCount<kC14AnimEventCapacity)gC14AnimEvents[gC14AnimEventCount++]={objKey,frameKey,cellKey,gFrameSerial,kind,width,height,compressed,flip};else ++gC14AnimOverflow;}
+    }
+
+    void writeSpriteProof(const char* phase)
+    {
+        FILE* f=nullptr /* C48 CLEAN1 disabled legacy diagnostic log */;if(!f)return;
+        std::fprintf(f,"DF3D C3D38 DEPTHREPLAY1 V1\nmarker=DF3DS_C3D38_DEPTHREPLAY1_V4\nparent=DF3DS_C3D27_MIRRORPAIR1_V4\nphase=%s frame=%llu\nmaxNativePlanes=%lu nativeSubmitted=%lu waxSubmitted=%lu fmeSubmitted=%lu layerOverflow=%lu\nspriteTex hit=%lu miss=%lu uploads=%lu evicts=%lu blocked=%lu orientation=DIRECT_CELL_ROWS__POT_TOPALIGNED_VBASE_TO_ONE__MORTON8 spriteDepth=LEQUAL_TEST_COLORWRITE_ONLY\nwallClip full=%lu partial=%lu rejected=%lu left=%lu right=%lu\nwallClass solid=%lu upper=%lu lower=%lu upperInvalid=%lu lowerInvalid=%lu samples=%lu sampleOverflow=%lu diagnostic=SOLID_ORANGE_UPPER_CYAN_LOWER_MAGENTA_UNTEXTURED\nlowerVertical columns=%lu anyClamped=%lu topClamped=%lu bottomClamped=%lu both=%lu emptyAfterClamp=%lu maxTopDelta=%ld maxBottomDelta=%ld maxTotalDelta=%ld sampleReplaced=%lu owner=CLASSIC_WINDOWTOP_WINDOWBOT_POSTCLAMP\nmaskRoute dispatch=%lu df0=%lu extAdj=%lu extFloor=%lu bothExt=%lu adjMidTex=%lu transparentSuppressed=%lu samples=%lu sampleOverflow=%lu owner=CLASSIC_WALL_DRAWMASK_PLUS_DEFERRED_ADJ_MID_TEX\nlowerVisGate auditColumns=%lu visibleColumns=%lu emptyColumns=%lu clampedColumns=%lu suppressedDraws=%lu partialDraws=%lu fullDraws=%lu unknownDraws=%lu frameOverflow=%lu summaryWalls=%lu summaryOverflow=%lu owner=CLASSIC_ZERO_SURVIVING_LOWER_PIXELS_ONLY\nmirrorPair frames=%lu matches=%lu overlaps=%lu lowerOverlap=%lu upperOverlap=%lu samples=%lu sampleOverflow=%lu owner=RWALL_MIRRORWALL_SAME_FRAME_X_OVERLAP\nflatTopology edges=%lu loops=%lu finalized=%lu loopFail=%lu beginReject=%lu edgeReject=%lu finishMissing=%lu flatTris=%lu earClipFail=%lu owner=VS_INDEX_TO_WS_GEOMETRY\nweapon blits=%lu scaled=%lu lit=%lu submitted=%lu maxLayers=%lu nativeUploads=%lu nativeEvicts=%lu sourceLayout=COLUMN_MAJOR_HEIGHT_STRIDE semantics=RECT_CLIP_SCALE_LIGHT_CLASSIC_SOURCE_MORTON8\nspriteAudit states=%lu events=%lu transitions=%lu overflow=%lu\nnativeSign layers=%lu draws=%lu captured=%lu submitted=%lu texResolved=%lu texMiss=%lu transparent=%lu illum=%lu stateChanges=%lu layerOverflow=%lu drawOverflow=%lu stateOverflow=%lu\ninteractable sectorStates=%lu sectorChanges=%lu sectorEvents=%lu sectorOverflow=%lu signCalls=%lu signUnique=%lu signOverflow=%lu maskCalls=%lu maskUnique=%lu maskOverflow=%lu model3DCalls=%lu model3DUnique=%lu model3DOverflow=%lu\ngeometry=CLASSIC_HORIZONTAL_WINDOW_CLIPPED_WALLS__C21_ALL_NATIVE_WALL_COLOR_COVERAGE__C21_LOWER_VERTICAL_WINDOW_PARITY_AUDIT__C23_ZERO_VISIBLE_LOWER_GATE__SECOBJECT_WAXFRAME_POT_UVBASE__NATIVE_SIGN nativeWorldDepth=LEQUAL_WRITE_ALL nativeSpriteDepth=LEQUAL_WRITE_COLOR alphaKey=INDEX0 softwareUnderlay=COMPATIBILITY_ONLY hud=SOFTWARE_SCREENSPACE stereo=OFF\n",
+            phase?phase:"UNKNOWN",(unsigned long long)gFrameSerial,(unsigned long)gSummaryMaxSpriteLayers,(unsigned long)gSummarySpriteSubmitted,(unsigned long)gSummaryWaxSubmitted,(unsigned long)gSummaryFmeSubmitted,(unsigned long)gSummarySpriteOverflow,(unsigned long)gSpriteTexHits,(unsigned long)gSpriteTexMiss,(unsigned long)gSummarySpriteTexUploads,(unsigned long)gSummarySpriteTexEvicts,(unsigned long)gSummarySpriteTexBlocked,
+            (unsigned long)gC19WallClipFull,(unsigned long)gC19WallClipPartial,(unsigned long)gC19WallClipRejected,(unsigned long)gC19WallClipLeft,(unsigned long)gC19WallClipRight,
+            (unsigned long)gC20SolidDraws,(unsigned long)gC20UpperDraws,(unsigned long)gC20LowerDraws,(unsigned long)gC20UpperInvalid,(unsigned long)gC20LowerInvalid,(unsigned long)gC20WallSampleCount,(unsigned long)gC20WallSampleOverflow,
+            (unsigned long)gC21LowerColumns,(unsigned long)gC21LowerAnyClamped,(unsigned long)gC21LowerTopClamped,(unsigned long)gC21LowerBottomClamped,(unsigned long)gC21LowerBothClamped,(unsigned long)gC21LowerEmptyAfterClamp,(long)gC21LowerMaxTopDelta,(long)gC21LowerMaxBottomDelta,(long)gC21LowerMaxTotalDelta,(unsigned long)gC21LowerSampleReplaced,
+            (unsigned long)gC22MaskDispatchCalls,(unsigned long)gC22MaskDrawFlagsZero,(unsigned long)gC22MaskExtAdjCalls,(unsigned long)gC22MaskExtFloorCalls,(unsigned long)gC22MaskBothExtCalls,(unsigned long)gC22MaskMidTexCalls,(unsigned long)gC22TransparentSuppressed,(unsigned long)gC22MaskRouteSampleCount,(unsigned long)gC22MaskRouteSampleOverflow,
+            (unsigned long)gC23LowerAuditColumns,(unsigned long)gC23LowerVisibleColumns,(unsigned long)gC23LowerEmptyColumns,(unsigned long)gC23LowerClampedColumns,(unsigned long)gC23LowerSuppressedDraws,(unsigned long)gC23LowerPartialDraws,(unsigned long)gC23LowerFullDraws,(unsigned long)gC23LowerUnknownDraws,(unsigned long)gC23LowerFrameOverflow,(unsigned long)gC23LowerSummaryCount,(unsigned long)gC23LowerSummaryOverflow,
+            (unsigned long)gC27PairFrames,(unsigned long)gC27PairMatches,(unsigned long)gC27PairOverlaps,(unsigned long)gC27LowerPairOverlaps,(unsigned long)gC27UpperPairOverlaps,(unsigned long)gC27PairSampleCount,(unsigned long)gC27PairSampleOverflow,
+            (unsigned long)gFlatEdgesCaptured,(unsigned long)gFlatLoopsBuilt,(unsigned long)gFlatTopologyFinalized,(unsigned long)gFlatLoopFail,(unsigned long)gFlatBeginReject,(unsigned long)gFlatEdgeReject,(unsigned long)gFlatFinishMissing,(unsigned long)gSummaryMaxFlatTris,(unsigned long)gSummaryMaxEarClipFail,
+            (unsigned long)gSummaryWeaponBlits,(unsigned long)gSummaryWeaponScaled,(unsigned long)gSummaryWeaponLit,(unsigned long)gSummaryWeaponSubmittedCount,(unsigned long)gSummaryMaxWeaponLayers,(unsigned long)gWeaponNativeUploads,(unsigned long)gWeaponNativeEvicts,
+            (unsigned long)gC14AnimStateCount,(unsigned long)gC14AnimEventCount,(unsigned long)gC14AnimTransitions,(unsigned long)gC14AnimOverflow,
+            (unsigned long)gC18SummaryMaxSignLayers,(unsigned long)gC18SummaryMaxSignDraws,(unsigned long)gC18SignCaptureCalls,(unsigned long)gC18SignSubmitted,(unsigned long)gC18SignTexResolved,(unsigned long)gC18SignTexMiss,(unsigned long)gC18SignTransparentSubmitted,(unsigned long)gC18SignIllumSubmitted,(unsigned long)gC18SignStateChanges,(unsigned long)gC18SignLayerOverflow,(unsigned long)gC18SignDrawOverflow,(unsigned long)gC18SignStateOverflow,
+            (unsigned long)gC14SectorStateCount,(unsigned long)gC14SectorChanges,(unsigned long)gC14SectorEventCount,(unsigned long)gC14SectorOverflow,(unsigned long)gC14SignCalls,(unsigned long)gC14SignCount,(unsigned long)gC14SignOverflow,(unsigned long)gC14MaskCalls,(unsigned long)gC14MaskCount,(unsigned long)gC14MaskOverflow,(unsigned long)gC14ModelCalls,(unsigned long)gC14ModelCount,(unsigned long)gC14ModelOverflow);
+        for(std::uint32_t i=0;i<gC27PairSampleCount;++i)
+        {
+            const C27PairSample& s=gC27PairSamples[i];
+            std::fprintf(f,"mirrorPair[%lu] wall=%p mirror=%p surface=%lu a=(%ld,%ld) b=(%ld,%ld)\n",
+                (unsigned long)i,s.wall,s.mirror,(unsigned long)s.surface,(long)s.ax0,(long)s.ax1,(long)s.bx0,(long)s.bx1);
+        }
+        for(std::uint32_t i=0;i<gC23LowerSummaryCount;++i)
+        {
+            const C23LowerWallSummary& s=gC23LowerSummary[i];
+            std::fprintf(f,"lowerVis[%lu] wall=%p draws=%lu suppressed=%lu partial=%lu full=%lu unknown=%lu columns=%lu visible=%lu empty=%lu clamped=%lu\n",
+                (unsigned long)i,s.wallKey,(unsigned long)s.draws,(unsigned long)s.suppressed,(unsigned long)s.partial,(unsigned long)s.full,(unsigned long)s.unknown,
+                (unsigned long)s.columns,(unsigned long)s.visibleColumns,(unsigned long)s.emptyColumns,(unsigned long)s.clampedColumns);
+        }
+        for(std::uint32_t i=0;i<gC22MaskRouteSampleCount;++i)
+        {
+            const C22MaskRouteSample& s=gC22MaskRouteSamples[i];
+            std::fprintf(f,"maskRoute[%lu] stage=%ld wall=%p tex=%p next=%p df=%ld draw=(%ld,%ld) sectorExt=%ld nextExtAdj=%ld nextExtFloor=%ld adjMidTex=%ld calls=%lu\n",
+                (unsigned long)i,(long)s.stage,s.wallKey,s.textureKey,s.nextSectorKey,(long)s.drawFlags,(long)s.drawX0,(long)s.drawX1,
+                (long)s.sectorExterior,(long)s.nextExtAdj,(long)s.nextExtFloorAdj,(long)s.adjMidTex,(unsigned long)s.calls);
+        }
+        for(std::uint32_t i=0;i<kC21LowerClipSampleCapacity;++i)
+        {
+            const C21LowerClipSample& s=gC21LowerClipSamples[i];if(s.totalDelta<=0)continue;
+            std::fprintf(f,"lowerClip[%lu] wall=%p x=%ld raw=(%ld,%ld) clipped=(%ld,%ld) window=(%ld,%ld) delta=(%ld,%ld) total=%ld\n",
+                (unsigned long)i,s.wallKey,(long)s.x,(long)s.rawTop,(long)s.rawBottom,(long)s.clippedTop,(long)s.clippedBottom,
+                (long)s.windowTop,(long)s.windowBottom,(long)s.topDelta,(long)s.bottomDelta,(long)s.totalDelta);
+        }
+        for(std::uint32_t i=0;i<gC20WallSampleCount;++i)
+        {
+            const C20WallSample& s=gC20WallSamples[i];
+            std::fprintf(f,"wallSample[%lu] class=%lu wall=%p tex=%p top=%ld bottom=%ld draw=(%ld,%ld) projected=(%ld,%ld) off=(%ld,%ld) texelH=%ld texSize=%ldx%ld\n",
+                (unsigned long)i,(unsigned long)s.surfaceClass,s.wallKey,s.textureKey,(long)s.topHeight,(long)s.bottomHeight,
+                (long)s.drawX0,(long)s.drawX1,(long)s.projectedX0,(long)s.projectedX1,(long)s.offsetX,(long)s.offsetZ,
+                (long)s.texelHeight,(long)s.texWidth,(long)s.texHeight);
+        }
+        for(std::uint32_t i=0;i<gC14AnimEventCount;++i){const C14AnimEvent& e=gC14AnimEvents[i];std::fprintf(f,"anim[%lu] frameSerial=%llu kind=%ld obj=%p frame=%p cell=%p size=%ldx%ld compressed=%ld flip=%ld\n",(unsigned long)i,(unsigned long long)e.frameSerial,(long)e.kind,(void*)e.objKey,(void*)e.frameKey,(void*)e.cellKey,(long)e.width,(long)e.height,(long)e.compressed,(long)e.flip);}
+        for(std::uint32_t i=0;i<gC14SectorEventCount;++i){const C14SectorEvent& e=gC14SectorEvents[i];std::fprintf(f,"sectorMotion[%lu] frameSerial=%llu sector=%p floor=%ld ceil=%ld vertices=%ld hash=%llu\n",(unsigned long)i,(unsigned long long)e.frameSerial,(void*)e.key,(long)e.floorHeight,(long)e.ceilingHeight,(long)e.vertexCount,(unsigned long long)e.hash);}
+        for(std::uint32_t i=0;i<gC14SignCount;++i){const C14SurfaceState& s=gC14Signs[i];std::fprintf(f,"sign[%lu] wall=%p tex=%p off=(%ld,%ld) flags=%lu calls=%lu\n",(unsigned long)i,(void*)s.ownerKey,(void*)s.textureKey,(long)s.x,(long)s.z,(unsigned long)s.flags,(unsigned long)s.calls);}
+        for(std::uint32_t i=0;i<gC14MaskCount;++i){const C14SurfaceState& s=gC14Masks[i];std::fprintf(f,"mask[%lu] wall=%p tex=%p nextSector=%p calls=%lu\n",(unsigned long)i,(void*)s.ownerKey,(void*)s.textureKey,(void*)s.auxKey,(unsigned long)s.calls);}
+        for(std::uint32_t i=0;i<gC14ModelCount;++i){const C14ModelState& s=gC14Models[i];std::fprintf(f,"model3D[%lu] obj=%p model=%p ws=(%ld,%ld,%ld) calls=%lu\n",(unsigned long)i,(void*)s.objectKey,(void*)s.modelKey,(long)s.x,(long)s.y,(long)s.z,(unsigned long)s.calls);}
+        std::fclose(f);
+    }
+
+
+
+    bool ensureGpu()
+    {
+        if (gGpuReady) return true;
+        gDvlb=DVLB_ParseFile(reinterpret_cast<u32*>(const_cast<u8*>(df3ds_onewall_c3d_shbin)),df3ds_onewall_c3d_shbin_size);
+        if (!gDvlb) return false;
+        shaderProgramInit(&gProgram); gProgramInit=true; shaderProgramSetVsh(&gProgram,&gDvlb->DVLE[0]);
+        gProjectionUniform=shaderInstanceGetUniformLocation(gProgram.vertexShader,"projection"); gScreenUniform=shaderInstanceGetUniformLocation(gProgram.vertexShader,"screenParams");
+        if (gProjectionUniform<0 || gScreenUniform<0) return false;
+        gVertices=static_cast<OneWallVertex*>(linearAlloc(sizeof(OneWallVertex)*kVertexCapacity)); if (!gVertices) return false;
+        Mtx_OrthoTilt(&gProjection,0.0f,400.0f,240.0f,0.0f,0.0f,1.0f,true); gGpuReady=true; return true;
+    }
+
+    void writeVertex(OneWallVertex& v,float x,float depth,float vertical,SurfaceClass surfaceClass,float u,float tv)
+    {
+        v.position[0]=x; v.position[1]=depth; v.position[2]=vertical; v.position[3]=1.0f;
+        v.texcoord[0]=u; v.texcoord[1]=tv; v.texcoord[2]=0.0f; v.texcoord[3]=1.0f;
+        if (surfaceClass==Surface_Upper)      { v.color[0]=0.0f; v.color[1]=1.0f; v.color[2]=1.0f; v.color[3]=1.0f; }
+        else if (surfaceClass==Surface_Lower){ v.color[0]=1.0f; v.color[1]=0.0f; v.color[2]=1.0f; v.color[3]=1.0f; }
+        else if (surfaceClass==Surface_Floor){ v.color[0]=0.10f;v.color[1]=1.0f; v.color[2]=0.20f;v.color[3]=1.0f; }
+        else if (surfaceClass==Surface_Ceiling){v.color[0]=0.28f;v.color[1]=0.20f;v.color[2]=1.0f;v.color[3]=1.0f;}
+        else { v.color[0]=1.0f; v.color[1]=0.18f; v.color[2]=0.02f; v.color[3]=1.0f; }
+    }
+
+
+    inline std::int32_t mulFixed(std::int32_t a,std::int32_t b) { return static_cast<std::int32_t>((static_cast<std::int64_t>(a)*b)>>16); }
+    inline float cross2(const FlatPoint& a,const FlatPoint& b,const FlatPoint& c) { return (b.x-a.x)*(c.z-a.z)-(b.z-a.z)*(c.x-a.x); }
+    bool pointInTri(const FlatPoint& p,const FlatPoint& a,const FlatPoint& b,const FlatPoint& c,bool ccw)
+    {
+        const float c0=cross2(a,b,p),c1=cross2(b,c,p),c2=cross2(c,a,p),e=1.0e-6f;
+        return ccw ? (c0>=-e&&c1>=-e&&c2>=-e) : (c0<=e&&c1<=e&&c2<=e);
+    }
+    void appendFlat(const FlatPoint& a,const FlatPoint& b,const FlatPoint& c,std::int32_t h,std::int32_t eye,std::int32_t fx,std::int32_t fy,std::int32_t ox,std::int32_t oy,SurfaceClass cls,const MaterialView& material)
+    { FlatTri& t=gFlatTris[gFlatTriCount++];t.p[0]=a;t.p[1]=b;t.p[2]=c;t.worldHeight=h;t.eyeHeight=eye;t.focalLength=fx;t.focalLenAspect=fy;t.projOffsetX=ox;t.projOffsetY=oy;t.surfaceClass=cls;t.material=material; }
+
+    void setTexEnv(bool textured)
+    {
+        for (int stage=0;stage<6;++stage) C3D_TexEnvInit(C3D_GetTexEnv(stage)); C3D_TexEnv* env=C3D_GetTexEnv(0);
+        if (textured) { C3D_TexEnvSrc(env,C3D_Both,GPU_TEXTURE0); C3D_TexEnvFunc(env,C3D_Both,GPU_REPLACE); }
+        else { C3D_TexEnvSrc(env,C3D_Both,GPU_PRIMARY_COLOR); C3D_TexEnvFunc(env,C3D_Both,GPU_REPLACE); }
+    }
+
+
+    void updateSummary()
+    {
+        std::uint32_t solid=0,upper=0,lower=0,uv=0;for(std::uint32_t i=0;i<gDrawCount;++i){if(gDraws[i].surfaceClass==Surface_Upper)++upper;else if(gDraws[i].surfaceClass==Surface_Lower)++lower;else{++solid;if(gDraws[i].carrier.hasMidTexture)++uv;}}
+        gSummaryMaxWalls=std::max(gSummaryMaxWalls,gDrawCount);gSummaryMaxSolid=std::max(gSummaryMaxSolid,solid);gSummaryMaxUpper=std::max(gSummaryMaxUpper,upper);gSummaryMaxLower=std::max(gSummaryMaxLower,lower);gSummaryMaxUvWalls=std::max(gSummaryMaxUvWalls,uv);gSummaryMaxFlatSectors=std::max(gSummaryMaxFlatSectors,gFlatSectorCount);gSummaryMaxFlatTris=std::max(gSummaryMaxFlatTris,gFlatTriCount);gSummaryMaxEarClipFail=std::max(gSummaryMaxEarClipFail,gEarClipFail);gSummaryMaxFlatOverflow=std::max(gSummaryMaxFlatOverflow,gFlatTriOverflow+gFlatSectorOverflow);gSummaryMaxVertexOverflow=std::max(gSummaryMaxVertexOverflow,gVertexOverflow);gSummaryMaxWeaponLayers=std::max(gSummaryMaxWeaponLayers,gWeaponLayerCount);
+        gSummaryWallTexHits+=gWallTexHits;gSummaryWallTexMiss+=gWallTexMiss;gSummaryFlatTexHits+=gFlatTexHits;gSummaryFlatTexMiss+=gFlatTexMiss;gSummaryWeaponTexHits+=gWeaponTexHits;gSummaryWeaponTexMiss+=gWeaponTexMiss;gSummaryTextureUploads=gTextureUploads;gSummaryTextureUploadFail=gTextureUploadFail;gSummaryTextureEvicts=gTextureEvicts;gSummaryPaletteReloads=gPaletteReloads;gSummaryFlatCleaned+=gFlatCleaned;
+    }
+
+    void writeProofLog(const char* phase)
+    {
+        FILE* f=nullptr /* C48 CLEAN1 disabled legacy diagnostic log */;if(!f)return;std::fprintf(f,
+        "DF3D C3D28 COVERAGE1 WORLD V4\nmarker=DF3DS_C3D38_DEPTHREPLAY1_V4\nparent=DF3DS_C3D27_MIRRORPAIR1_V4\nphase=%s frame=%llu\nmaxWalls=%lu solid=%lu upper=%lu lower=%lu uvWalls=%lu\\nmaxFlatSectors=%lu maxFlatTris=%lu maxEarClipFail=%lu flatCleaned=%lu flatOverflow=%lu vertexOverflow=%lu\\nwallTex hit=%lu miss=%lu flatTex hit=%lu miss=%lu weaponTex hit=%lu miss=%lu maxWeaponLayers=%lu weaponSubmitted=%d\\ncache uploads=%lu uploadFail=%lu evicts=%lu paletteReloads=%lu\\ndepthSubmitted=%d directClipZ=YES softwareUnderlay=YES stereo=OFF lighting=PALETTE_ONLY_NO_COLORMAP maskedWalls=SOFTWARE_FALLBACK\\n",
+        phase?phase:"UNKNOWN",(unsigned long long)gFrameSerial,(unsigned long)gSummaryMaxWalls,(unsigned long)gSummaryMaxSolid,(unsigned long)gSummaryMaxUpper,(unsigned long)gSummaryMaxLower,(unsigned long)gSummaryMaxUvWalls,(unsigned long)gSummaryMaxFlatSectors,(unsigned long)gSummaryMaxFlatTris,(unsigned long)gSummaryMaxEarClipFail,(unsigned long)gSummaryFlatCleaned,(unsigned long)gSummaryMaxFlatOverflow,(unsigned long)gSummaryMaxVertexOverflow,(unsigned long)gSummaryWallTexHits,(unsigned long)gSummaryWallTexMiss,(unsigned long)gSummaryFlatTexHits,(unsigned long)gSummaryFlatTexMiss,(unsigned long)gSummaryWeaponTexHits,(unsigned long)gSummaryWeaponTexMiss,(unsigned long)gSummaryMaxWeaponLayers,gSummaryWeaponSubmitted?1:0,(unsigned long)gSummaryTextureUploads,(unsigned long)gSummaryTextureUploadFail,(unsigned long)gSummaryTextureEvicts,(unsigned long)gSummaryPaletteReloads,gSummaryDepthSubmitted?1:0);std::fclose(f);
+    }
+
+    void logProofOnce()
+    {
+        updateSummary();
+        if (!gProofLogged) { gProofLogged=true; writeProofLog("FIRST_NATIVE"); }
+    }
+
+
+
+}
+
+
+
+
+void portalLineEnter(
+    const void* portalWall,const void* curSector,const void* nextSector,
+    std::int32_t depth,std::int32_t childX0,std::int32_t childX1,
+    std::int32_t childMinY,std::int32_t childMaxY,
+    std::int32_t wallX0,std::int32_t wallX1,
+    std::int32_t z0,std::int32_t z1,
+    std::int32_t curFloor,std::int32_t curCeil,
+    std::int32_t nextFloor,std::int32_t nextCeil,
+    std::uint32_t curFlags,std::uint32_t nextFlags)
+{
+    if(gPLFlushed)return;
+    if(!gPLStartFrame)gPLStartFrame=gFrameSerial;
+    const std::uint64_t serial=++gPLSerial;
+
+    if(gPLStackDepth<kPLStackCap)
+        gPLStack[gPLStackDepth++]={serial,depth};
+    else
+        ++gPLStackOverflow;
+
+    if(!plInCaptureWindow())return;
+    if(gPLPortalCount>=kPLPortalCap){++gPLPortalOverflow;return;}
+    gPLPortals[gPLPortalCount++]={
+        gFrameSerial,serial,portalWall,curSector,nextSector,
+        depth,childX0,childX1,childMinY,childMaxY,
+        wallX0,wallX1,z0,z1,
+        curFloor,curCeil,nextFloor,nextCeil,curFlags,nextFlags
+    };
+}
+
+void portalLineLeave()
+{
+    if(gPLFlushed)return;
+    if(gPLStackDepth) --gPLStackDepth;
+}
+
+
+void ownerTraceClassicTransparent(
+    const void* wallKey,const void* textureKey,const void* imagePtr,
+    std::uint32_t wallFlags,std::int32_t drawFlags,
+    std::int32_t x0,std::int32_t x1)
+{
+    if(!wallKey)return;
+    otAddClassicOverlay(wallKey,textureKey,imagePtr,OT_TRANS,wallFlags,drawFlags,x0,x1);
+    if(otIsTarget(wallKey))otMarkTarget(OT_TRANS,textureKey,imagePtr,wallFlags,drawFlags,x0,x1);
+}
+
+void auditMaskRoute(const void* wallKey,const void* textureKey,const void* nextSectorKey,
+    std::int32_t drawFlags,std::int32_t drawX0,std::int32_t drawX1,
+    std::int32_t sectorExterior,std::int32_t nextExtAdj,std::int32_t nextExtFloorAdj,
+    std::int32_t adjMidTex,std::int32_t stage)
+{
+    if(!wallKey)return;
+    if(stage==0)
+    {
+        otAddClassicOverlay(wallKey,textureKey,nullptr,OT_MASK,0u,drawFlags,drawX0,drawX1);
+        if(otIsTarget(wallKey))
+        {
+            const std::uint32_t packed=(sectorExterior?1u:0u)|(nextExtAdj?2u:0u)|(nextExtFloorAdj?4u:0u)|(adjMidTex?8u:0u);
+            otMarkTarget(OT_MASK,textureKey,nullptr,packed,drawFlags,drawX0,drawX1);
+        }
+    }
+    if(stage==0)
+    {
+        ++gC22MaskDispatchCalls;
+        if(drawFlags==0)++gC22MaskDrawFlagsZero;
+        if(nextExtAdj)++gC22MaskExtAdjCalls;
+        if(nextExtFloorAdj)++gC22MaskExtFloorCalls;
+        if(nextExtAdj&&nextExtFloorAdj)++gC22MaskBothExtCalls;
+        if(adjMidTex)++gC22MaskMidTexCalls;
+    }
+    else if(stage==1)
+    {
+        ++gC22TransparentSuppressed;
+    }
+    for(std::uint32_t i=0;i<gC22MaskRouteSampleCount;++i)
+    {
+        C22MaskRouteSample& s=gC22MaskRouteSamples[i];
+        if(s.wallKey==wallKey&&s.textureKey==textureKey&&s.nextSectorKey==nextSectorKey&&s.drawFlags==drawFlags&&s.stage==stage&&
+           s.sectorExterior==sectorExterior&&s.nextExtAdj==nextExtAdj&&s.nextExtFloorAdj==nextExtFloorAdj&&s.adjMidTex==adjMidTex)
+        {++s.calls;s.drawX0=drawX0;s.drawX1=drawX1;return;}
+    }
+    if(gC22MaskRouteSampleCount>=kC22MaskRouteSampleCapacity){++gC22MaskRouteSampleOverflow;return;}
+    C22MaskRouteSample& s=gC22MaskRouteSamples[gC22MaskRouteSampleCount++];
+    s={wallKey,textureKey,nextSectorKey,drawFlags,drawX0,drawX1,sectorExterior,nextExtAdj,nextExtFloorAdj,adjMidTex,stage,1u};
+}
+
+void auditUpperVerticalClip(const void* wallKey,std::int32_t x,std::int32_t clippedTop,std::int32_t clippedBottom)
+{
+    c43CapturePortalColumn(wallKey,x,clippedTop,clippedBottom,Surface_Upper);
+    plRecordClip(wallKey,x,clippedTop,clippedBottom,std::uint32_t(Surface_Upper));
+}
+
+void auditLowerVerticalClip(const void* wallKey,std::int32_t x,
+    std::int32_t rawTop,std::int32_t rawBottom,std::int32_t clippedTop,std::int32_t clippedBottom,
+    std::int32_t windowTop,std::int32_t windowBottom)
+{
+    if(otIsTarget(wallKey)&&clippedTop<=clippedBottom)
+    {
+        gOTFrame.y0=std::min(gOTFrame.y0,clippedTop);
+        gOTFrame.y1=std::max(gOTFrame.y1,clippedBottom);
+    }
+
+    c43CapturePortalColumn(wallKey,x,clippedTop,clippedBottom,Surface_Lower);
+    plRecordClip(wallKey,x,clippedTop,clippedBottom,std::uint32_t(Surface_Lower));
+    C23LowerFrameVis* c23=c23FindLowerFrame(wallKey,true);
+    if(c23)
+    {
+        ++c23->columns;++gC23LowerAuditColumns;
+        if(clippedTop<=clippedBottom){++c23->visibleColumns;++gC23LowerVisibleColumns;}
+        else{++c23->emptyColumns;++gC23LowerEmptyColumns;}
+        if(clippedTop!=rawTop||clippedBottom!=rawBottom){++c23->clampedColumns;++gC23LowerClampedColumns;}
+    }
+    c28AuditLowerColumn(wallKey,x,rawTop,rawBottom,clippedTop,clippedBottom);
+    ++gC21LowerColumns;
+    const std::int32_t topDelta = clippedTop>rawTop ? clippedTop-rawTop : 0;
+    const std::int32_t bottomDelta = clippedBottom<rawBottom ? rawBottom-clippedBottom : 0;
+    if(topDelta>0||bottomDelta>0)++gC21LowerAnyClamped;
+    if(topDelta>0)++gC21LowerTopClamped;
+    if(bottomDelta>0)++gC21LowerBottomClamped;
+    if(topDelta>0&&bottomDelta>0)++gC21LowerBothClamped;
+    if(clippedTop>clippedBottom)++gC21LowerEmptyAfterClamp;
+    gC21LowerMaxTopDelta=std::max(gC21LowerMaxTopDelta,topDelta);
+    gC21LowerMaxBottomDelta=std::max(gC21LowerMaxBottomDelta,bottomDelta);
+    const std::int32_t totalDelta=topDelta+bottomDelta;
+    gC21LowerMaxTotalDelta=std::max(gC21LowerMaxTotalDelta,totalDelta);
+    if(totalDelta<=0)return;
+    C21LowerClipSample sample{wallKey,x,rawTop,rawBottom,clippedTop,clippedBottom,windowTop,windowBottom,topDelta,bottomDelta,totalDelta};
+    for(std::uint32_t i=0;i<kC21LowerClipSampleCapacity;++i)
+    {
+        if(gC21LowerClipSamples[i].totalDelta==0){gC21LowerClipSamples[i]=sample;return;}
+    }
+    std::uint32_t minI=0;
+    for(std::uint32_t i=1;i<kC21LowerClipSampleCapacity;++i)
+        if(gC21LowerClipSamples[i].totalDelta<gC21LowerClipSamples[minI].totalDelta)minI=i;
+    if(totalDelta>gC21LowerClipSamples[minI].totalDelta){gC21LowerClipSamples[minI]=sample;++gC21LowerSampleReplaced;}
+}
+
+void captureNativeSign(const void* wallKey,const void* textureKey,const void* image,
+    std::int32_t width,std::int32_t height,std::int32_t logSizeY,std::int32_t palIndex,
+    std::int32_t offsetX,std::int32_t offsetZ,std::int32_t transparent,std::int32_t illumSign)
+{
+    if(!wallKey||!textureKey||!image||width<=0||height<=0||width>1024||height>1024) return;
+    ++gC18SignCaptureCalls;c18TrackSignState(wallKey,textureKey);
+    C18SignLayer* s=c18FindFrameSign(wallKey);
+    if(!s)
+    {
+        if(gC18SignLayerCount>=kC18SignLayerCapacity){++gC18SignLayerOverflow;return;}
+        s=&gC18SignLayers[gC18SignLayerCount++];
+    }
+    s->wallKey=wallKey;s->material=makeMaterial(textureKey,image,width,height,logSizeY,palIndex,0,0,0,0);
+    s->offsetX=offsetX;s->offsetZ=offsetZ;s->transparent=transparent?1:0;s->illumSign=illumSign?1:0;
+    gC18SummaryMaxSignLayers=std::max(gC18SummaryMaxSignLayers,gC18SignLayerCount);
+}
+
+    void auditSectorGeometry(const void* sectorKey,const void* verticesWS,std::int32_t vertexCount,std::int32_t floorHeight,std::int32_t ceilingHeight)
+    {
+        if(!sectorKey||!verticesWS||vertexCount<=0||vertexCount>512) return;
+        const C14FixedXZ* v=static_cast<const C14FixedXZ*>(verticesWS);
+        std::uint64_t h=1469598103934665603ull;for(std::int32_t i=0;i<vertexCount;++i){h^=static_cast<std::uint32_t>(v[i].x);h*=1099511628211ull;h^=static_cast<std::uint32_t>(v[i].z);h*=1099511628211ull;}
+        C14SectorState* s=nullptr;for(std::uint32_t i=0;i<gC14SectorStateCount;++i)if(gC14SectorStates[i].key==sectorKey){s=&gC14SectorStates[i];break;}
+        bool changed=false;if(!s){if(gC14SectorStateCount>=kC14SectorStateCapacity){++gC14SectorOverflow;return;}s=&gC14SectorStates[gC14SectorStateCount++];*s={};s->active=true;s->key=sectorKey;}
+        else changed=(s->hash!=h)||(s->floorHeight!=floorHeight)||(s->ceilingHeight!=ceilingHeight)||(s->vertexCount!=vertexCount);
+        ++s->observations;if(changed){++s->changes;++gC14SectorChanges;if(gC14SectorEventCount<kC14SectorEventCapacity)gC14SectorEvents[gC14SectorEventCount++]={sectorKey,gFrameSerial,h,floorHeight,ceilingHeight,vertexCount};else ++gC14SectorOverflow;}
+        s->hash=h;s->floorHeight=floorHeight;s->ceilingHeight=ceilingHeight;s->vertexCount=vertexCount;
+    }
+
+    void auditSignSurface(const void* wallKey,const void* textureKey,std::int32_t offsetX,std::int32_t offsetZ,std::uint32_t flags1)
+    {
+        if(!wallKey||!textureKey) return;
+        ++gC14SignCalls;
+        for(std::uint32_t i=0;i<gC14SignCount;++i)if(gC14Signs[i].ownerKey==wallKey&&gC14Signs[i].textureKey==textureKey){++gC14Signs[i].calls;return;}
+        if(gC14SignCount>=kC14SurfaceCapacity){++gC14SignOverflow;return;}C14SurfaceState& s=gC14Signs[gC14SignCount++];s={wallKey,textureKey,nullptr,offsetX,offsetZ,flags1,1u,true};
+    }
+
+    void auditMaskedWall(const void* wallKey,const void* textureKey,const void* nextSectorKey)
+    {
+        if(!wallKey) return;
+        ++gC14MaskCalls;
+        for(std::uint32_t i=0;i<gC14MaskCount;++i)if(gC14Masks[i].ownerKey==wallKey&&gC14Masks[i].textureKey==textureKey&&gC14Masks[i].auxKey==nextSectorKey){++gC14Masks[i].calls;return;}
+        if(gC14MaskCount>=kC14SurfaceCapacity){++gC14MaskOverflow;return;}C14SurfaceState& s=gC14Masks[gC14MaskCount++];s={wallKey,textureKey,nextSectorKey,0,0,0u,1u,true};
+    }
+
+    void audit3DObject(const void* objectKey,const void* modelKey,std::int32_t xWS,std::int32_t yWS,std::int32_t zWS)
+    {
+        if(!objectKey||!modelKey) return;
+        ++gC14ModelCalls;
+        for(std::uint32_t i=0;i<gC14ModelCount;++i)if(gC14Models[i].objectKey==objectKey&&gC14Models[i].modelKey==modelKey){C14ModelState& s=gC14Models[i];++s.calls;s.x=xWS;s.y=yWS;s.z=zWS;return;}
+        if(gC14ModelCount>=kC14ModelCapacity){++gC14ModelOverflow;return;}C14ModelState& s=gC14Models[gC14ModelCount++];s={objectKey,modelKey,xWS,yWS,zWS,1u,true};
+    }
+
+void beginFrame()
+{
+    plMaybeFlush();
+    c20WriteIdentityOnce();
+    c23ResetLowerFrame();
+    gC43PortalColumnCount=0;gC43PortalColumnOverflow=0;
+    c28ResetPending();
+    gSpriteLayerCount=0;gSpriteLayerOverflow=0;for(std::uint32_t i=0;i<kSpriteLayerCapacity;++i){gSpriteVertexValid[i]=false;gSpriteTex[i]=nullptr;}
+    gC18SignLayerCount=0;gC18SignLayerOverflow=0;gC18SignDrawCount=0;gC18SignDrawOverflow=0;
+
+    ++gFrameSerial;otResetFrame();gCarrierCount=0;gCarrierOverflow=0;gLookupMiss=0;gDrawCount=0;gDrawOverflow=0;gFlatTriCount=0;gFlatSectorCount=0;gEarClipFail=0;gFlatTriOverflow=0;gFlatSectorOverflow=0;gVertexOverflow=0;
+    gWallMaterialCount=0;gWeaponLayerCount=0;gWeaponLayerOverflow=0;gWallTexHits=0;gWallTexMiss=0;gFlatTexHits=0;gFlatTexMiss=0;gWeaponTexHits=0;gWeaponTexMiss=0;gFlatCleaned=0;
+
+    // DF3DS_C3D11_TAKEOVERFIX1_V2: topology/weapon descriptor frame reset.
+    gFlatEdgeCount=0;for(std::uint32_t i=0;i<kFlatSectorCapacity;++i)gFlatBuilds[i]={};for(std::uint32_t i=0;i<kWeaponLayerCapacity;++i)gWeaponVertexValid[i]=false;
+}
+
+
+
+void rememberAcceptedSolid(const void* wallKey,std::int32_t x0View,std::int32_t z0View,std::int32_t x1View,std::int32_t z1View,
+    std::int32_t floorHeight,std::int32_t ceilingHeight,std::int32_t projectedX0,std::int32_t projectedX1,
+    std::int32_t uCoord0,std::int32_t uScale,std::int32_t orientDzDx,std::int32_t midOffsetX,std::int32_t midOffsetZ,
+    std::int32_t midTexelHeight,std::int32_t midTextureWidth,std::int32_t flipHoriz,std::int32_t hasMidTexture)
+{
+    if (!wallKey || z0View<=0 || z1View<=0) return;
+    Carrier* c=findCarrier(wallKey);
+    if (!c)
+    {
+        if (gCarrierCount>=kCarrierCapacity) { ++gCarrierOverflow; return; }
+        c=&gCarriers[gCarrierCount++]; c->key=wallKey;
+    }
+    c->x0=x0View;c->z0=z0View;c->x1=x1View;c->z1=z1View;c->floorHeight=floorHeight;c->ceilingHeight=ceilingHeight;
+    c->projectedX0=projectedX0;c->projectedX1=projectedX1;
+    c->uCoord0=uCoord0;c->uScale=uScale;c->orientDzDx=orientDzDx;c->midOffsetX=midOffsetX;c->midOffsetZ=midOffsetZ;
+    c->midTexelHeight=midTexelHeight;c->midTextureWidth=midTextureWidth;c->flipHoriz=flipHoriz;c->hasMidTexture=hasMidTexture;
+}
+
+void registerWallMaterial(const void* wallKey,SurfaceClass cls,const void* textureKey,const void* image,std::int32_t width,std::int32_t height,
+    std::int32_t logSizeY,std::int32_t palIndex,std::int32_t offsetX,std::int32_t offsetZ,std::int32_t texelHeight,std::int32_t flipHoriz)
+{
+    if (!wallKey || (cls!=Surface_Solid&&cls!=Surface_Upper&&cls!=Surface_Lower)) return; WallMaterialSet* s=findWallMaterials(wallKey);
+    if (!s) { if (gWallMaterialCount>=kWallMaterialCapacity) return; s=&gWallMaterials[gWallMaterialCount++]; s->wallKey=wallKey; }
+    MaterialView m=makeMaterial(textureKey,image,width,height,logSizeY,palIndex,offsetX,offsetZ,texelHeight,flipHoriz);
+    if (cls==Surface_Upper) s->upper=m; else if (cls==Surface_Lower) s->lower=m; else s->solid=m;
+}
+
+
+void appendFlatLoop(FlatSectorBuild& b,const std::int32_t* loop,int loopCount)
+{
+    FlatPoint pts[kFlatPolyMax];int n=0;
+    for(int li=0;li<loopCount;++li)
+    {
+        const int vi=loop[li];if(vi<0||vi>=b.vertexCount){++gFlatLoopFail;b.failed=true;return;}
+        if(n>0&&iabs(b.ws[vi].x-pts[n-1].wx)<=1&&iabs(b.ws[vi].z-pts[n-1].wz)<=1){++gFlatCleaned;continue;}
+        pts[n++]={fixedToFloat(b.vs[vi].x),fixedToFloat(b.vs[vi].z),b.ws[vi].x,b.ws[vi].z};
+    }
+    if(n>2&&iabs(pts[0].wx-pts[n-1].wx)<=1&&iabs(pts[0].wz-pts[n-1].wz)<=1){--n;++gFlatCleaned;}
+    bool changed=true;while(changed&&n>3){changed=false;for(int i=0;i<n;++i){const int p=(i+n-1)%n,q=(i+1)%n;if(std::abs(cross2(pts[p],pts[i],pts[q]))<=1.0e-6f){for(int j=i;j+1<n;++j)pts[j]=pts[j+1];--n;++gFlatCleaned;changed=true;break;}}}
+    if(n<3){++gFlatLoopFail;b.failed=true;return;}double area=0.0;for(int i=0;i<n;++i){const FlatPoint& a=pts[i];const FlatPoint& c=pts[(i+1)%n];area+=double(a.x)*c.z-double(c.x)*a.z;}
+    if(area>-1.0e-8&&area<1.0e-8){++gFlatLoopFail;b.failed=true;return;}const bool ccw=area>0.0;int idx[kFlatPolyMax];for(int i=0;i<n;++i)idx[i]=i;TriIndex tris[kFlatPolyMax];int triCount=0,remain=n,guard=0;
+    while(remain>3&&guard++<int(kFlatPolyMax*kFlatPolyMax)){bool clipped=false;for(int i=0;i<remain;++i){const int ip=idx[(i+remain-1)%remain],ic=idx[i],in=idx[(i+1)%remain];const float cr=cross2(pts[ip],pts[ic],pts[in]);if(ccw?cr<=1.0e-7f:cr>=-1.0e-7f)continue;bool contains=false;for(int j=0;j<remain;++j){const int p=idx[j];if(p==ip||p==ic||p==in)continue;if(pointInTri(pts[p],pts[ip],pts[ic],pts[in],ccw)){contains=true;break;}}if(contains)continue;tris[triCount++]={ip,ic,in};for(int j=i;j+1<remain;++j)idx[j]=idx[j+1];--remain;clipped=true;break;}if(!clipped){++gEarClipFail;++gFlatLoopFail;b.failed=true;return;}}
+    if(remain==3)tris[triCount++]={idx[0],idx[1],idx[2]};if(triCount!=n-2){++gEarClipFail;++gFlatLoopFail;b.failed=true;return;}if(gFlatTriCount+std::uint32_t(triCount*2)>kFlatTriCapacity){++gFlatTriOverflow;b.failed=true;return;}
+    for(int i=0;i<triCount;++i){const TriIndex& t=tris[i];appendFlat(pts[t.a],pts[t.b],pts[t.c],b.floorHeight,b.eyeHeight,b.focalLength,b.focalLenAspect,b.projOffsetX,b.projOffsetY,Surface_Floor,b.floorMat);appendFlat(pts[t.c],pts[t.b],pts[t.a],b.ceilingHeight,b.eyeHeight,b.focalLength,b.focalLenAspect,b.projOffsetX,b.projOffsetY,Surface_Ceiling,b.ceilMat);}++gFlatLoopsBuilt;
+}
+
+void finalizeSectorFlatTopology(FlatSectorBuild& b)
+{
+    if(b.finalized)return;b.finalized=true;++gFlatTopologyFinalized;
+    if(b.failed||b.edgeCount<3||b.edgeCount>std::int32_t(kFlatPolyMax)){++gFlatLoopFail;b.failed=true;return;}
+    bool used[kFlatPolyMax]{};int consumed=0;
+    while(consumed<b.edgeCount)
+    {
+        int seed=-1;for(int i=0;i<b.edgeCount;++i)if(!used[i]){seed=i;break;}if(seed<0)break;
+        std::int32_t loop[kFlatPolyMax];int n=0;const FlatEdge& se=gFlatEdges[b.edgeStart+seed];used[seed]=true;++consumed;const int start=se.a;int cur=se.b;loop[n++]=start;if(cur!=start)loop[n++]=cur;int guard=0;
+        while(cur!=start&&guard++<=b.edgeCount)
+        {
+            int hit=-1,next=-1;for(int i=0;i<b.edgeCount;++i){if(used[i])continue;const FlatEdge& e=gFlatEdges[b.edgeStart+i];if(e.a==cur){hit=i;next=e.b;break;}if(e.b==cur){hit=i;next=e.a;break;}}
+            if(hit<0){++gFlatLoopFail;b.failed=true;return;}used[hit]=true;++consumed;cur=next;if(cur!=start){if(n>=int(kFlatPolyMax)){++gFlatLoopFail;b.failed=true;return;}loop[n++]=cur;}
+        }
+        if(cur!=start||n<3){++gFlatLoopFail;b.failed=true;return;}appendFlatLoop(b,loop,n);if(b.failed)return;
+    }
+}
+
+void captureSectorFlats(const void* sectorKey,const void* verticesWS,const void* verticesVS,std::int32_t vertexCount,
+    std::int32_t floorHeight,std::int32_t ceilingHeight,std::int32_t eyeHeight,std::int32_t focalLength,std::int32_t focalLenAspect,std::int32_t projOffsetX,std::int32_t projOffsetY,
+    const void* floorKey,const void* floorImage,std::int32_t floorW,std::int32_t floorH,std::int32_t floorLogY,std::int32_t floorPal,std::int32_t floorOffX,std::int32_t floorOffZ,
+    const void* ceilKey,const void* ceilImage,std::int32_t ceilW,std::int32_t ceilH,std::int32_t ceilLogY,std::int32_t ceilPal,std::int32_t ceilOffX,std::int32_t ceilOffZ)
+{
+    if(!sectorKey||!verticesWS||!verticesVS||vertexCount<3||vertexCount>std::int32_t(kFlatPolyMax)){++gFlatBeginReject;++gFlatLoopFail;return;}
+    for(std::uint32_t i=0;i<gFlatSectorCount;++i)if(gFlatSectorKeys[i]==sectorKey)return;
+    if(gFlatSectorCount>=kFlatSectorCapacity||gFlatEdgeCount>=kFlatEdgeCapacity){++gFlatBeginReject;++gFlatSectorOverflow;return;}
+    const std::uint32_t slot=gFlatSectorCount++;gFlatSectorKeys[slot]=sectorKey;FlatSectorBuild& b=gFlatBuilds[slot];b={};b.key=sectorKey;b.ws=static_cast<const FixedXZ*>(verticesWS);b.vs=static_cast<const FixedXZ*>(verticesVS);b.vertexCount=vertexCount;b.edgeStart=std::int32_t(gFlatEdgeCount);b.floorHeight=floorHeight;b.ceilingHeight=ceilingHeight;b.eyeHeight=eyeHeight;b.focalLength=focalLength;b.focalLenAspect=focalLenAspect;b.projOffsetX=projOffsetX;b.projOffsetY=projOffsetY;b.floorMat=makeMaterial(floorKey,floorImage,floorW,floorH,floorLogY,floorPal,floorOffX,floorOffZ,0,0);b.ceilMat=makeMaterial(ceilKey,ceilImage,ceilW,ceilH,ceilLogY,ceilPal,ceilOffX,ceilOffZ,0,0);
+}
+
+void captureSectorFlatEdge(const void* sectorKey,std::int32_t v0Index,std::int32_t v1Index)
+{
+    FlatSectorBuild* b=nullptr;for(std::uint32_t i=0;i<gFlatSectorCount;++i)if(gFlatBuilds[i].key==sectorKey){b=&gFlatBuilds[i];break;}
+    if(!b||b->finalized||b->failed){++gFlatEdgeReject;return;}
+    if(v0Index<0||v1Index<0||v0Index>=b->vertexCount||v1Index>=b->vertexCount||b->edgeCount>=std::int32_t(kFlatPolyMax)||gFlatEdgeCount>=kFlatEdgeCapacity){++gFlatEdgeReject;++gFlatLoopFail;b->failed=true;return;}
+    gFlatEdges[gFlatEdgeCount++]={v0Index,v1Index};++b->edgeCount;++gFlatEdgesCaptured;
+}
+
+void finishSectorFlatTopology(const void* sectorKey)
+{
+    FlatSectorBuild* b=nullptr;for(std::uint32_t i=0;i<gFlatSectorCount;++i)if(gFlatBuilds[i].key==sectorKey){b=&gFlatBuilds[i];break;}
+    if(!b){++gFlatFinishMissing;return;}finalizeSectorFlatTopology(*b);
+}
+
+
+
+
+
+void captureNativeSpritePlane(const void* objKey,const void* frameKey,const void* cellKey,const void* cellData,const void* image,const void* columnOffsets,
+    std::int32_t sizeX,std::int32_t sizeY,std::int32_t compressed,std::int32_t flip,
+    std::int32_t objXWS,std::int32_t objYWS,std::int32_t objZWS,
+    std::int32_t objXVS,std::int32_t objYVS,std::int32_t objZVS,
+    std::int32_t frameOffsetX,std::int32_t frameOffsetY,std::int32_t frameWidthWS,std::int32_t frameHeightWS,
+    std::int32_t focalLength,std::int32_t focalLenAspect,std::int32_t projOffsetX,std::int32_t projOffsetY,const void* lightTable,std::int32_t sourceKind)
+{
+    if (!cellKey||!cellData||!image||!columnOffsets||sizeX<=0||sizeY<=0||sizeX>1024||sizeY>1024||objZVS<=0||frameWidthWS<=0||frameHeightWS<=0) return;
+    c14AuditSpriteFrame(objKey,frameKey,cellKey,sourceKind,sizeX,sizeY,compressed,flip);
+    if (gSpriteLayerCount>=kSpriteLayerCapacity) { ++gSpriteLayerOverflow;gSummarySpriteOverflow=std::max(gSummarySpriteOverflow,gSpriteLayerOverflow);return; }
+    SpriteLayer& s=gSpriteLayers[gSpriteLayerCount++];
+    s.cellKey=cellKey;s.cell=static_cast<const std::uint8_t*>(cellData);s.image=static_cast<const std::uint8_t*>(image);s.columnOffset=static_cast<const std::uint32_t*>(columnOffsets);s.light=static_cast<const std::uint8_t*>(lightTable);
+    s.width=sizeX;s.height=sizeY;s.compressed=compressed;s.flip=flip;
+    s.objXWS=objXWS;s.objYWS=objYWS;s.objZWS=objZWS;s.objXVS=objXVS;s.objYVS=objYVS;s.objZVS=objZVS;
+    s.frameOffsetX=frameOffsetX;s.frameOffsetY=frameOffsetY;s.frameWidthWS=frameWidthWS;s.frameHeightWS=frameHeightWS;
+    s.focalLength=focalLength;s.focalLenAspect=focalLenAspect;s.projOffsetX=projOffsetX;s.projOffsetY=projOffsetY;s.sourceKind=sourceKind;
+    gSummaryMaxSpriteLayers=std::max(gSummaryMaxSpriteLayers,gSpriteLayerCount);
+    if(gSpriteAnchorSampleCount<kSpriteAnchorSampleCapacity)
+    {
+        SpriteAnchorSample& a=gSpriteAnchorSamples[gSpriteAnchorSampleCount++];
+        const std::int32_t left=objXVS-frameOffsetX;
+        const std::int32_t top=objYVS-(frameHeightWS-frameOffsetY);
+        a={sourceKind,objXWS,objYWS,objZWS,objXVS,objYVS,objZVS,frameOffsetX,frameOffsetY,frameWidthWS,frameHeightWS,left,top,left+frameWidthWS,top+frameHeightWS};
+    }
+}
+
+void captureWeaponBlit(const void* textureKey,const void* image,std::int32_t width,std::int32_t height,std::int32_t logSizeY,std::int32_t palIndex,
+    std::int32_t screenX,std::int32_t screenY,std::int32_t xScale,std::int32_t yScale,
+    std::int32_t clipX0,std::int32_t clipY0,std::int32_t clipX1,std::int32_t clipY1,const void* lightTable,std::int32_t scaled,std::int32_t lit)
+{
+    if(!textureKey||!image||width<=0||height<=0||xScale<=0||yScale<=0)return;if(gWeaponLayerCount>=kWeaponLayerCapacity){++gWeaponLayerOverflow;return;}
+    WeaponLayer& w=gWeaponLayers[gWeaponLayerCount++];w.material=makeMaterial(textureKey,image,width,height,logSizeY,palIndex,0,0,0,0);w.light=static_cast<const std::uint8_t*>(lightTable);w.x=screenX;w.y=screenY;w.xScale=xScale;w.yScale=yScale;w.clipX0=clipX0;w.clipY0=clipY0;w.clipX1=clipX1;w.clipY1=clipY1;w.scaled=scaled;w.lit=lit;
+    ++gSummaryWeaponBlits;if(scaled)++gSummaryWeaponScaled;if(lit)++gSummaryWeaponLit;
+}
+
+
+
+void considerDrawnSolid(const void* wallKey,std::int32_t drawX0,std::int32_t drawX1,std::int32_t eyeHeight,
+    std::int32_t focalLength,std::int32_t focalLenAspect,std::int32_t projOffsetX,std::int32_t projOffsetY)
+{
+
+    if(otIsTarget(wallKey))otMarkTarget(OT_SOLID,nullptr,nullptr,0u,-1,drawX0,drawX1);
+
+    Carrier* c=findCarrier(wallKey);
+    if (!c)
+    {
+        ++gLookupMiss;
+        return;
+    }
+
+    if (gDrawCount>=kDrawCapacity)
+    {
+        ++gDrawOverflow;
+        return;
+    }
+
+    DrawWall& d=gDraws[gDrawCount++];
+    d.carrier=*c;
+    d.mirrorKey=nullptr;
+    d.c28CaptureX0=0;d.c28CaptureX1=-1;d.c28Columns=0;d.c28VisibleColumns=0;d.c28EmptyColumns=0;d.c28ClampedColumns=0;d.c28RangeMatch=0;
+    d.drawX0=drawX0;
+    d.drawX1=drawX1;
+    d.eyeHeight=eyeHeight;
+    d.focalLength=focalLength;
+    d.focalLenAspect=focalLenAspect;
+    d.projOffsetX=projOffsetX;
+    d.projOffsetY=projOffsetY;
+    d.topHeight=c->ceilingHeight;
+    d.bottomHeight=c->floorHeight;
+    d.surfaceClass=Surface_Solid;
+}
+
+void considerDrawnAdjoinStrip(
+    const void* wallKey,
+    const void* mirrorKey,
+    std::int32_t drawX0,
+    std::int32_t drawX1,
+    std::int32_t eyeHeight,
+    std::int32_t focalLength,
+    std::int32_t focalLenAspect,
+    std::int32_t projOffsetX,
+    std::int32_t projOffsetY,
+    std::int32_t worldHeightA,
+    std::int32_t worldHeightB,
+    SurfaceClass surfaceClass)
+{
+
+    if(otIsTarget(wallKey))
+    {
+        const std::uint32_t r=surfaceClass==Surface_Upper?OT_UPPER:
+                              surfaceClass==Surface_Lower?OT_LOWER:0u;
+        if(r)otMarkTarget(r,nullptr,nullptr,0u,-1,drawX0,drawX1);
+    }
+
+    if (surfaceClass != Surface_Upper && surfaceClass != Surface_Lower)
+        return;
+
+    Carrier* c=findCarrier(wallKey);
+    if (!c)
+    {
+        ++gLookupMiss;
+        return;
+    }
+
+    if (worldHeightA == worldHeightB)
+        return;
+
+    if (gDrawCount>=kDrawCapacity)
+    {
+        ++gDrawOverflow;
+        return;
+    }
+
+    DrawWall& d=gDraws[gDrawCount++];
+    d.carrier=*c;
+    d.mirrorKey=mirrorKey;
+    d.drawX0=drawX0;
+    d.drawX1=drawX1;
+    d.eyeHeight=eyeHeight;
+    d.focalLength=focalLength;
+    d.focalLenAspect=focalLenAspect;
+    d.projOffsetX=projOffsetX;
+    d.projOffsetY=projOffsetY;
+    d.topHeight=worldHeightA < worldHeightB ? worldHeightA : worldHeightB;
+    d.bottomHeight=worldHeightA < worldHeightB ? worldHeightB : worldHeightA;
+    d.surfaceClass=surfaceClass;
+    if(surfaceClass==Surface_Lower)c28BindLowerSubmission(d);
+    else{d.c28CaptureX0=0;d.c28CaptureX1=-1;d.c28Columns=0;d.c28VisibleColumns=0;d.c28EmptyColumns=0;d.c28ClampedColumns=0;d.c28RangeMatch=0;}
+}
+
+
+
+
+bool hasWall()
+{
+    return (gDrawCount>0u || gFlatTriCount>0u) && gFrameSerial!=gPresentedSerial;
+}
+
+
+
+
+    void c39CaptureWallLife()
+    {
+        for(std::uint32_t i=0;i<gDrawCount;++i)
+        {
+            const DrawWall& d=gDraws[i];
+            if(d.surfaceClass!=Surface_Lower)continue;
+            C39WallLifeRow& r=gC39WallLife[gC39WallLifeHead];
+            r={};r.frame=gFrameSerial;r.wallKey=d.carrier.key;r.drawX0=d.drawX0;r.drawX1=d.drawX1;
+            r.topHeight=d.topHeight;r.bottomHeight=d.bottomHeight;
+            r.focalLength=d.focalLength;r.focalLenAspect=d.focalLenAspect;r.projOffsetX=d.projOffsetX;r.projOffsetY=d.projOffsetY;
+            r.valid=gC19WallVertexValid[i]?1u:0u;r.vertexStart=gWallVertexStart[i];
+            if(r.valid)
+            {
+                const std::uint32_t b=gWallVertexStart[i];
+                r.vx0=gVertices[b].position[0];r.vz0=gVertices[b].position[1];r.vyTop=gVertices[b].position[2];
+                r.vx1=gVertices[b+2].position[0];r.vz1=gVertices[b+2].position[1];r.vyBottom=gVertices[b+2].position[2];
+            }
+            gC39WallLifeHead=(gC39WallLifeHead+1u)%kC39WallLifeCap;
+            if(gC39WallLifeCount<kC39WallLifeCap)++gC39WallLifeCount;
+        }
+    }
+
+    void c39WriteProof(const char* phase)
+    {
+        FILE* f=nullptr /* C48 CLEAN1 disabled legacy diagnostic log */;
+        if(!f)return;
+        std::fprintf(f,"DF3D C3D39 WALLLIFE1 V4\nmarker=DF3DS_C3D39_WALLLIFE1_V4\nparent=DF3DS_C3D38_DEPTHREPLAY1_V4\nphase=%s frame=%llu rows=%lu\n",
+            phase?phase:"UNKNOWN",(unsigned long long)gFrameSerial,(unsigned long)gC39WallLifeCount);
+        const std::uint32_t start=(gC39WallLifeHead+kC39WallLifeCap-gC39WallLifeCount)%kC39WallLifeCap;
+        for(std::uint32_t n=0;n<gC39WallLifeCount;++n)
+        {
+            const C39WallLifeRow& r=gC39WallLife[(start+n)%kC39WallLifeCap];
+            std::fprintf(f,
+                "frame=%llu wall=%p x=%ld..%ld valid=%lu vstart=%lu top=%ld bot=%ld focal=%ld aspect=%ld proj=%ld,%ld v0=(%.6f,%.6f,%.6f) v2=(%.6f,%.6f,%.6f)\n",
+                (unsigned long long)r.frame,r.wallKey,(long)r.drawX0,(long)r.drawX1,(unsigned long)r.valid,(unsigned long)r.vertexStart,
+                (long)r.topHeight,(long)r.bottomHeight,(long)r.focalLength,(long)r.focalLenAspect,(long)r.projOffsetX,(long)r.projOffsetY,
+                r.vx0,r.vz0,r.vyTop,r.vx1,r.vz1,r.vyBottom);
+        }
+        std::fclose(f);
+    }
+
+
+
+
+    // DF3DS_C3D57_TARGETSUPPRESS1_V1 — visible diagnostic only.
+    constexpr std::uintptr_t kC57TargetWall=0x08968df0u;
+    std::uint32_t gC57SuppressedUpper=0,gC57SuppressedLower=0;
+    std::uint64_t gC57FirstFrame=0,gC57LastFrame=0;
+
+    static bool c57SuppressTarget(const DrawWall& d)
+    {
+        if(reinterpret_cast<std::uintptr_t>(d.carrier.key)!=kC57TargetWall)return false;
+        return d.surfaceClass==Surface_Upper||d.surfaceClass==Surface_Lower;
+    }
+
+    static void c57NoteSuppressed(const DrawWall& d)
+    {
+        if(!gC57FirstFrame)gC57FirstFrame=gFrameSerial;
+        gC57LastFrame=gFrameSerial;
+        if(d.surfaceClass==Surface_Upper)++gC57SuppressedUpper;
+        else if(d.surfaceClass==Surface_Lower)++gC57SuppressedLower;
+    }
+
+    static void c57WriteProof()
+    {
+        char path[256];
+        std::snprintf(path,sizeof(path),
+            "sdmc:/3ds/DarkForces3DS/logs/DF3D_C3D57_TARGETSUPPRESS1_V1_%llu.log",
+            (unsigned long long)osGetTime());
+        FILE* f=std::fopen(path,"w");
+        if(!f)return;
+        std::fprintf(f,
+            "DF3D C3D57 TARGETSUPPRESS1 V1\n"
+            "target=0x%08lx suppressedUpper=%lu suppressedLower=%lu "
+            "firstFrame=%llu lastFrame=%llu\n",
+            (unsigned long)kC57TargetWall,
+            (unsigned long)gC57SuppressedUpper,(unsigned long)gC57SuppressedLower,
+            (unsigned long long)gC57FirstFrame,(unsigned long long)gC57LastFrame);
+        std::fclose(f);
+    }
+
+    static void otCaptureFrame()
+    {
+        if(!gOTFrame.routes||gOTFrame.x0>gOTFrame.x1)return;
+
+        OTEvent e{};
+        e.frame=gFrameSerial;e.targetRoutes=gOTFrame.routes;e.targetWallFlags=gOTFrame.wallFlags;
+        e.targetDrawFlags=gOTFrame.drawFlags;e.targetX0=gOTFrame.x0;e.targetX1=gOTFrame.x1;
+        e.targetY0=gOTFrame.y0;e.targetY1=gOTFrame.y1;
+        e.targetTextureKey=gOTFrame.textureKey;e.targetImagePtr=gOTFrame.imagePtr;
+        e.classicOverlayOverflow=gOTFrame.overlayOverflow;
+
+        if(!e.targetTextureKey||!e.targetImagePtr)
+        {
+            WallMaterialSet* ts=findWallMaterials(reinterpret_cast<const void*>(kOTTargetWall));
+            if(ts&&validMaterial(ts->solid))
+            {
+                if(!e.targetTextureKey)e.targetTextureKey=ts->solid.key;
+                if(!e.targetImagePtr)e.targetImagePtr=ts->solid.image;
+            }
+        }
+
+        for(std::uint32_t i=0;i<gOTFrame.overlayCount;++i)
+        {
+            const OTClassicOverlay& o=gOTFrame.overlays[i];
+            if(o.x1<e.targetX0||o.x0>e.targetX1)continue;
+            if(e.classicOverlayCount<kOTClassicOverlayCap)e.classicOverlay[e.classicOverlayCount++]=o;
+            else ++e.classicOverlayOverflow;
+        }
+
+        for(std::uint32_t i=0;i<gDrawCount;++i)
+        {
+            const DrawWall& d=gDraws[i];
+            if(d.drawX1<e.targetX0||d.drawX0>e.targetX1)continue;
+            if(e.nativeCount>=kOTNativeCap){++e.nativeOverflow;continue;}
+            const MaterialView* mv=wallMaterial(d);
+            NativeTexture* nt=gWallTex[i];
+            OTNative& n=e.native[e.nativeCount++];
+            n.wallKey=d.carrier.key;n.materialKey=mv?mv->key:nullptr;n.imagePtr=mv?static_cast<const void*>(mv->image):nullptr;
+            n.gpuKey=nt?nt->key:nullptr;n.cls=std::uint32_t(d.surfaceClass);n.alpha=nt&&nt->alpha?1u:0u;
+            n.x0=d.drawX0;n.x1=d.drawX1;n.topHeight=d.topHeight;n.bottomHeight=d.bottomHeight;
+        }
+
+        for(std::uint32_t si=0;si<gC18SignLayerCount;++si)
+        {
+            const C18SignLayer& s=gC18SignLayers[si];
+            bool overlap=otIsTarget(s.wallKey);
+            for(std::uint32_t ni=0;!overlap&&ni<e.nativeCount;++ni)if(e.native[ni].wallKey==s.wallKey)overlap=true;
+            if(!overlap)continue;
+            if(e.signCount>=kOTSignCap){++e.signOverflow;continue;}
+            e.sign[e.signCount++]={s.wallKey,s.material.key,static_cast<const void*>(s.material.image),s.transparent,s.illumSign};
+        }
+
+        std::uint64_t h=1469598103934665603ull;
+        otHashMix(h,e.targetRoutes);otHashMix(h,e.targetWallFlags);otHashMix(h,std::uint64_t(std::uint32_t(e.targetDrawFlags)));
+        otHashMix(h,reinterpret_cast<std::uintptr_t>(e.targetTextureKey));
+        otHashMix(h,reinterpret_cast<std::uintptr_t>(e.targetImagePtr));
+        otHashMix(h,e.nativeCount);otHashMix(h,e.classicOverlayCount);otHashMix(h,e.signCount);
+        for(std::uint32_t i=0;i<e.nativeCount;++i)
+        {
+            const OTNative& n=e.native[i];
+            otHashMix(h,reinterpret_cast<std::uintptr_t>(n.wallKey));
+            otHashMix(h,reinterpret_cast<std::uintptr_t>(n.materialKey));
+            otHashMix(h,reinterpret_cast<std::uintptr_t>(n.imagePtr));
+            otHashMix(h,n.cls);otHashMix(h,n.alpha);
+        }
+        for(std::uint32_t i=0;i<e.classicOverlayCount;++i)
+        {
+            const OTClassicOverlay& o=e.classicOverlay[i];
+            otHashMix(h,reinterpret_cast<std::uintptr_t>(o.wallKey));
+            otHashMix(h,reinterpret_cast<std::uintptr_t>(o.textureKey));
+            otHashMix(h,reinterpret_cast<std::uintptr_t>(o.imagePtr));
+            otHashMix(h,o.route);otHashMix(h,o.wallFlags);
+        }
+        e.signature=h;
+
+        if(h==gOTLastSignature && gFrameSerial<gOTLastStoredFrame+30u)return;
+        gOTLastSignature=h;gOTLastStoredFrame=gFrameSerial;
+        gOTEvents[gOTEventWrite]=e;
+        gOTEventWrite=(gOTEventWrite+1u)%kOTEventCap;
+        ++gOTEventTotal;
+    }
+
+    static void otWriteLog()
+    {
+        if(!gOTEventTotal)return;
+        char path[256];
+        std::snprintf(path,sizeof(path),
+            "sdmc:/3ds/DarkForces3DS/logs/DF3D_C3D55_OWNERTRACE1_V4_%llu.log",
+            (unsigned long long)osGetTime());
+        FILE* f=std::fopen(path,"w");if(!f)return;
+        const std::uint32_t count=std::min<std::uint32_t>(gOTEventTotal,kOTEventCap);
+        const std::uint32_t start=gOTEventTotal>kOTEventCap?gOTEventWrite:0u;
+        std::fprintf(f,"DF3D C3D55 OWNERTRACE1 V4\n");
+        std::fprintf(f,"target=0x%08lx totalEvents=%lu retained=%lu ringWrapped=%d\n",
+            (unsigned long)kOTTargetWall,(unsigned long)gOTEventTotal,(unsigned long)count,
+            gOTEventTotal>kOTEventCap?1:0);
+        for(std::uint32_t q=0;q<count;++q)
+        {
+            const OTEvent& e=gOTEvents[(start+q)%kOTEventCap];
+            std::fprintf(f,
+                "E frame=%llu sig=%016llx routes=0x%lx wallFlags=0x%08lx drawFlags=%ld "
+                "targetX=%ld..%ld targetY=%ld..%ld tex=%p image=%p native=%lu classicOverlay=%lu sign=%lu "
+                "ovN=%lu ovC=%lu ovS=%lu\n",
+                (unsigned long long)e.frame,(unsigned long long)e.signature,(unsigned long)e.targetRoutes,
+                (unsigned long)e.targetWallFlags,(long)e.targetDrawFlags,
+                (long)e.targetX0,(long)e.targetX1,(long)e.targetY0,(long)e.targetY1,
+                e.targetTextureKey,e.targetImagePtr,(unsigned long)e.nativeCount,
+                (unsigned long)e.classicOverlayCount,(unsigned long)e.signCount,
+                (unsigned long)e.nativeOverflow,(unsigned long)e.classicOverlayOverflow,(unsigned long)e.signOverflow);
+            for(std::uint32_t i=0;i<e.classicOverlayCount;++i)
+            {
+                const OTClassicOverlay& o=e.classicOverlay[i];
+                std::fprintf(f,
+                    "  C wall=%p route=0x%lx tex=%p image=%p flags=0x%08lx drawFlags=%ld x=%ld..%ld\n",
+                    o.wallKey,(unsigned long)o.route,o.textureKey,o.imagePtr,(unsigned long)o.wallFlags,
+                    (long)o.drawFlags,(long)o.x0,(long)o.x1);
+            }
+            for(std::uint32_t i=0;i<e.nativeCount;++i)
+            {
+                const OTNative& n=e.native[i];
+                std::fprintf(f,
+                    "  N wall=%p cls=%lu mat=%p image=%p gpuKey=%p alpha=%lu x=%ld..%ld h=%ld..%ld%s\n",
+                    n.wallKey,(unsigned long)n.cls,n.materialKey,n.imagePtr,n.gpuKey,(unsigned long)n.alpha,
+                    (long)n.x0,(long)n.x1,(long)n.topHeight,(long)n.bottomHeight,
+                    otIsTarget(n.wallKey)?" TARGETKEY":"");
+            }
+            for(std::uint32_t i=0;i<e.signCount;++i)
+            {
+                const OTSign& s=e.sign[i];
+                std::fprintf(f,"  S wall=%p mat=%p image=%p transparent=%ld illum=%ld\n",
+                    s.wallKey,s.materialKey,s.imagePtr,(long)s.transparent,(long)s.illumSign);
+            }
+        }
+        std::fclose(f);
+    }
+
+void drawOverlay()
+{
+        // DF3DS_C3D48_CLEAN1_V2: ZL diagnostic mode retired.
+        c27AuditMirrorPairs(); // DF3DS_C3D27_MIRRORPAIR1_V3 observation only
+        c33AuditExteriorDepth(); // DF3DS_C3D33_EXTDEPTH1_V1 telemetry only
+
+    if (!hasWall() && gWeaponLayerCount==0u && gSpriteLayerCount==0u) return; if (!ensureGpu()) return; syncPalette(); std::uint32_t vertexCount=0;
+    // DF3DS_C3D19_WALLCLIP1_V1: intersect the classic accepted horizontal window back onto the view-space wall.
+    for(std::uint32_t i=0;i<gDrawCount;++i)
+    {
+        gC19WallVertexValid[i]=false;gWallTex[i]=nullptr;
+        const DrawWall& d=gDraws[i];const Carrier& c=d.carrier;
+        if(vertexCount+6u>kVertexCapacity){++gVertexOverflow;break;}
+        double t0=0.0,t1=1.0;bool clipLeft=false,clipRight=false;
+        if(!c19ClassicWallWindow(d,t0,t1,clipLeft,clipRight)){++gC19WallClipRejected;continue;}
+        if(clipLeft||clipRight){++gC19WallClipPartial;if(clipLeft)++gC19WallClipLeft;if(clipRight)++gC19WallClipRight;}else ++gC19WallClipFull;
+        const MaterialView* m=wallMaterial(d);
+        if(d.surfaceClass==Surface_Upper||d.surfaceClass==Surface_Lower)
+        {
+            bool seen=false;
+            for(std::uint32_t si=0;si<gC20WallSampleCount;++si)
+            {
+                const C20WallSample& s=gC20WallSamples[si];
+                if(s.wallKey==c.key&&s.surfaceClass==std::uint32_t(d.surfaceClass)&&s.textureKey==(m?m->key:nullptr)&&
+                   s.topHeight==d.topHeight&&s.bottomHeight==d.bottomHeight){seen=true;break;}
+            }
+            if(!seen)
+            {
+                if(gC20WallSampleCount<kC20WallSampleCapacity)
+                {
+                    C20WallSample& s=gC20WallSamples[gC20WallSampleCount++];
+                    s.wallKey=c.key;s.textureKey=m?m->key:nullptr;s.surfaceClass=std::uint32_t(d.surfaceClass);
+                    s.topHeight=d.topHeight;s.bottomHeight=d.bottomHeight;s.drawX0=d.drawX0;s.drawX1=d.drawX1;
+                    s.projectedX0=c.projectedX0;s.projectedX1=c.projectedX1;
+                    s.offsetX=m?m->offsetX:c.midOffsetX;s.offsetZ=m?m->offsetZ:c.midOffsetZ;
+                    s.texelHeight=m?m->texelHeight:c.midTexelHeight;s.texWidth=m?m->width:c.midTextureWidth;s.texHeight=m?m->height:0;
+                }
+                else ++gC20WallSampleOverflow;
+            }
+        }
+        NativeTexture* nt=m?acquireTexture(*m,false):nullptr;gWallTex[i]=nt;if(nt)++gWallTexHits;else ++gWallTexMiss;
+        const double x0d=double(c.x0)+double(c.x1-c.x0)*t0,z0d=double(c.z0)+double(c.z1-c.z0)*t0;
+        const double x1d=double(c.x0)+double(c.x1-c.x0)*t1,z1d=double(c.z0)+double(c.z1-c.z0)*t1;
+        const float x0=fixedToFloat(std::int32_t(x0d)),z0=fixedToFloat(std::int32_t(z0d)),x1=fixedToFloat(std::int32_t(x1d)),z1=fixedToFloat(std::int32_t(z1d));
+        c35AuditNativeWall(d,z0,z1); // DF3DS_C3D35_NEARPLANE1_V1: exact pre-writeVertex camera-Z observation.
+        const float top=fixedToFloat(d.eyeHeight-d.topHeight),bottom=fixedToFloat(d.eyeHeight-d.bottomHeight);
+        const std::int32_t ox=m?m->offsetX:c.midOffsetX,oz=m?m->offsetZ:c.midOffsetZ,th=m?m->texelHeight:c.midTexelHeight;
+        const std::int32_t baseU=c.uCoord0+ox;const std::int32_t fullDelta=c.orientDzDx?mulFixed(c.x1-c.x0,c.uScale):mulFixed(c.z1-c.z0,c.uScale);
+        std::int32_t uf0=std::int32_t(double(baseU)+double(fullDelta)*t0),uf1=std::int32_t(double(baseU)+double(fullDelta)*t1);
+        const int tw=(m&&m->width>0)?m->width:c.midTextureWidth;if(m&&m->flipHoriz&&tw>0){const std::int32_t edge=(tw<<16)-65536;uf0=edge-uf0;uf1=edge-uf1;}
+        // DF3DS_C3D49_VCOORD2_V1: Citro vertical association follows proven native sprite convention.
+        const float du=nt?float(nt->gpuW):8.0f,dv=nt?float(nt->gpuH):8.0f;const float u0=fixedToFloat(uf0)/du,u1=fixedToFloat(uf1)/du,v0=1.0f-(fixedToFloat(oz)/dv),v1=1.0f-(fixedToFloat(oz+th)/dv);
+        const std::uint32_t b=vertexCount;
+        writeVertex(gVertices[b],x0,z0,top,d.surfaceClass,u0,v0);writeVertex(gVertices[b+1],x0,z0,bottom,d.surfaceClass,u0,v1);writeVertex(gVertices[b+2],x1,z1,bottom,d.surfaceClass,u1,v1);
+        writeVertex(gVertices[b+3],x1,z1,bottom,d.surfaceClass,u1,v1);writeVertex(gVertices[b+4],x1,z1,top,d.surfaceClass,u1,v0);writeVertex(gVertices[b+5],x0,z0,top,d.surfaceClass,u0,v0);
+        gWallVertexStart[i]=b;gC19WallVertexValid[i]=true;vertexCount+=6u;
+    }
+    // DF3DS_C3D39_WALLLIFE1_V4: snapshot lower-wall queue/vertex state after native wall generation.
+    c39CaptureWallLife();
+
+    const std::uint32_t flatStart=vertexCount;for(std::uint32_t i=0;i<gFlatTriCount;++i){if(vertexCount+3u>kVertexCapacity){++gVertexOverflow;break;}const FlatTri& t=gFlatTris[i];NativeTexture* nt=acquireTexture(t.material,false);gFlatTex[i]=nt;if(nt)++gFlatTexHits;else ++gFlatTexMiss;const float y=fixedToFloat(t.eyeHeight-t.worldHeight);for(int k=0;k<3;++k){float u=0,v=0;if(nt){const float ut=fixedToFloat(t.p[k].wx-t.material.offsetX)*8.0f,vt=fixedToFloat(t.material.offsetZ-t.p[k].wz)*8.0f;u=ut/float(nt->gpuW);v=vt/float(nt->gpuH);}writeVertex(gVertices[vertexCount+k],t.p[k].x,t.p[k].z,y,t.surfaceClass,u,v);}vertexCount+=3u;}
+    // DF3DS_C3D18_SIGN1_V1: native SIGN geometry reuses the exact accepted wall carrier and parent texture scale.
+    gC18SignDrawCount=0;
+    for(std::uint32_t si=0;si<gC18SignLayerCount;++si)
+    {
+        const C18SignLayer& s=gC18SignLayers[si];
+        for(std::uint32_t wi=0;wi<gDrawCount;++wi)
+        {
+            const DrawWall& d=gDraws[wi];if(d.carrier.key!=s.wallKey)continue;const MaterialView* pm=wallMaterial(d);if(!pm||pm->texelHeight==0)continue;
+            const Carrier& c=d.carrier;double wallT0=0.0,wallT1=1.0;bool wallClipLeft=false,wallClipRight=false;if(!c19ClassicWallWindow(d,wallT0,wallT1,wallClipLeft,wallClipRight))continue;const std::int64_t u0=std::int64_t(c.uCoord0)+std::int64_t(pm->offsetX);
+            const std::int32_t delta32=c.orientDzDx?mulFixed(c.x1-c.x0,c.uScale):mulFixed(c.z1-c.z0,c.uScale);const std::int64_t u1=u0+std::int64_t(delta32);const std::int64_t du=u1-u0;if(du==0)continue;
+            const std::int64_t signU0=s.offsetX,signU1=std::int64_t(s.offsetX)+(std::int64_t(s.material.width)<<16);
+            double ta=double(signU0-u0)/double(du),tb=double(signU1-u0)/double(du);double t0=std::max(wallT0,std::max(0.0,std::min(ta,tb))),t1=std::min(wallT1,std::min(1.0,std::max(ta,tb)));if(t1<=t0)continue;
+            const std::int64_t worldSpan=std::int64_t(d.bottomHeight)-std::int64_t(d.topHeight);if(worldSpan==0)continue;
+            const std::int64_t signBottom=std::int64_t(d.bottomHeight)+(worldSpan*std::int64_t(s.offsetZ))/std::int64_t(pm->texelHeight);
+            const std::int64_t signTop=signBottom-(worldSpan*(std::int64_t(s.material.height)<<16))/std::int64_t(pm->texelHeight);if(signBottom==signTop)continue;
+            const std::int64_t stripTop=std::min<std::int64_t>(d.topHeight,d.bottomHeight),stripBottom=std::max<std::int64_t>(d.topHeight,d.bottomHeight);
+            const std::int64_t fullTop=std::min(signTop,signBottom),fullBottom=std::max(signTop,signBottom);const std::int64_t clipTop=std::max(stripTop,fullTop),clipBottom=std::min(stripBottom,fullBottom);if(clipBottom<=clipTop)continue;
+            if(vertexCount+6u>kVertexCapacity||gC18SignDrawCount>=kC18SignDrawCapacity){++gC18SignDrawOverflow;continue;}
+            NativeTexture* nt=acquireTexture(s.material,s.transparent!=0,nullptr);if(!nt){++gC18SignTexMiss;continue;}++gC18SignTexResolved;
+            const double x0d=double(c.x0)+(double(c.x1-c.x0)*t0),z0d=double(c.z0)+(double(c.z1-c.z0)*t0),x1d=double(c.x0)+(double(c.x1-c.x0)*t1),z1d=double(c.z0)+(double(c.z1-c.z0)*t1);
+            const double uAt0=double(u0)+double(du)*t0,uAt1=double(u0)+double(du)*t1;const float tu0=float((uAt0-double(signU0))/65536.0/double(nt->gpuW)),tu1=float((uAt1-double(signU0))/65536.0/double(nt->gpuW));
+            const double vf0=double(clipTop-signTop)/double(signBottom-signTop),vf1=double(clipBottom-signTop)/double(signBottom-signTop);const float vSpan=float(nt->sourceH)/float(nt->gpuH),vBase=1.0f-vSpan,tv0=vBase+float(vf0)*vSpan,tv1=vBase+float(vf1)*vSpan;
+            constexpr float pull=0.9995f;const float x0=fixedToFloat(std::int32_t(x0d))*pull,z0=fixedToFloat(std::int32_t(z0d))*pull,x1=fixedToFloat(std::int32_t(x1d))*pull,z1=fixedToFloat(std::int32_t(z1d))*pull;
+            const float top=fixedToFloat(std::int32_t(std::int64_t(d.eyeHeight)-clipTop))*pull,bottom=fixedToFloat(std::int32_t(std::int64_t(d.eyeHeight)-clipBottom))*pull;const std::uint32_t b=vertexCount;
+            writeVertex(gVertices[b],x0,z0,top,d.surfaceClass,tu0,tv0);writeVertex(gVertices[b+1],x0,z0,bottom,d.surfaceClass,tu0,tv1);writeVertex(gVertices[b+2],x1,z1,bottom,d.surfaceClass,tu1,tv1);
+            writeVertex(gVertices[b+3],x1,z1,bottom,d.surfaceClass,tu1,tv1);writeVertex(gVertices[b+4],x1,z1,top,d.surfaceClass,tu1,tv0);writeVertex(gVertices[b+5],x0,z0,top,d.surfaceClass,tu0,tv0);
+            C18SignDraw& sd=gC18SignDraws[gC18SignDrawCount++];sd={nt,b,d.focalLength,d.focalLenAspect,d.projOffsetX,d.projOffsetY,s.transparent,s.illumSign};vertexCount+=6u;
+        }
+    }
+    gC18SummaryMaxSignDraws=std::max(gC18SummaryMaxSignDraws,gC18SignDrawCount);
+    // DF3DS_C3D18_SIGN1_V1: C3D17 POT V-base is sealed; restore C3D14 world-space SecObject/WaxFrame projection.
+    const std::uint32_t spriteStart=vertexCount;
+    for(std::uint32_t i=0;i<gSpriteLayerCount;++i)
+    {
+        gSpriteVertexValid[i]=false;gSpriteTex[i]=nullptr;if(vertexCount+6u>kVertexCapacity){++gVertexOverflow;break;}
+        const SpriteLayer& s=gSpriteLayers[i];SpriteNativeTexture* st=acquireSpriteTexture(s);if(!st)continue;
+        gSpriteTex[i]=st;const float uMax=float(st->sourceW)/float(st->gpuW),vSpan=float(st->sourceH)/float(st->gpuH),vTop=1.0f-vSpan,vBottom=1.0f;const float ul=s.flip?uMax:0.0f,ur=s.flip?0.0f:uMax;
+        const std::int32_t leftFx=s.objXVS-s.frameOffsetX;
+        const std::int32_t topFx=s.objYVS-(s.frameHeightWS-s.frameOffsetY);
+        const std::int32_t rightFx=leftFx+s.frameWidthWS;
+        const std::int32_t bottomFx=topFx+s.frameHeightWS;
+        const float x0=fixedToFloat(leftFx),x1=fixedToFloat(rightFx),z=fixedToFloat(s.objZVS),top=-fixedToFloat(topFx),bottom=-fixedToFloat(bottomFx);const std::uint32_t b=vertexCount;
+        writeVertex(gVertices[b],x0,z,top,Surface_Solid,ul,vTop);writeVertex(gVertices[b+1],x0,z,bottom,Surface_Solid,ul,vBottom);writeVertex(gVertices[b+2],x1,z,bottom,Surface_Solid,ur,vBottom);
+        writeVertex(gVertices[b+3],x1,z,bottom,Surface_Solid,ur,vBottom);writeVertex(gVertices[b+4],x1,z,top,Surface_Solid,ur,vTop);writeVertex(gVertices[b+5],x0,z,top,Surface_Solid,ul,vTop);
+        gSpriteVertexStart[i]=b;gSpriteVertexValid[i]=true;vertexCount+=6u;
+    }
+    const std::uint32_t weaponStart=vertexCount;
+    for(std::uint32_t i=0;i<gWeaponLayerCount;++i)
+    {
+        gWeaponVertexValid[i]=false;gWeaponTex[i]=nullptr;if(vertexCount+6u>kVertexCapacity){++gVertexOverflow;break;}const WeaponLayer& w=gWeaponLayers[i];NativeTexture* nt=acquireWeaponTexture(w);gWeaponTex[i]=nt;if(nt)++gWeaponTexHits;else{++gWeaponTexMiss;continue;}
+        const std::int64_t xs=w.scaled?w.xScale:65536,ys=w.scaled?w.yScale:65536;const std::int32_t dw=std::max<std::int32_t>(1,std::int32_t((std::int64_t(w.material.width)*xs)>>16));const std::int32_t dh=std::max<std::int32_t>(1,std::int32_t((std::int64_t(w.material.height)*ys)>>16));
+        const std::int32_t dx0=std::max(w.x,w.clipX0),dy0=std::max(w.y,w.clipY0),dx1=std::min(w.x+dw-1,w.clipX1),dy1=std::min(w.y+dh-1,w.clipY1);if(dx1<dx0||dy1<dy0)continue;
+        const std::int64_t su0=(std::int64_t(dx0-w.x)<<32)/xs,sv0=(std::int64_t(dy0-w.y)<<32)/ys,su1=(std::int64_t(dx1+1-w.x)<<32)/xs,sv1=(std::int64_t(dy1+1-w.y)<<32)/ys;
+        const float u0=std::max(0.0f,std::min(float(w.material.width)/float(nt->gpuW),float(double(su0)/65536.0/double(nt->gpuW))));const float v0=std::max(0.0f,std::min(float(w.material.height)/float(nt->gpuH),float(double(sv0)/65536.0/double(nt->gpuH))));const float u1=std::max(u0,std::min(float(w.material.width)/float(nt->gpuW),float(double(su1)/65536.0/double(nt->gpuW))));const float v1=std::max(v0,std::min(float(w.material.height)/float(nt->gpuH),float(double(sv1)/65536.0/double(nt->gpuH))));
+        const float x0=float(dx0)*1.25f,y0=float(dy0)*1.20f,x1=float(dx1+1)*1.25f,y1=float(dy1+1)*1.20f;const std::uint32_t b=vertexCount;writeVertex(gVertices[b],x0,1.0f,-y0,Surface_Solid,u0,v0);writeVertex(gVertices[b+1],x0,1.0f,-y1,Surface_Solid,u0,v1);writeVertex(gVertices[b+2],x1,1.0f,-y1,Surface_Solid,u1,v1);writeVertex(gVertices[b+3],x1,1.0f,-y1,Surface_Solid,u1,v1);writeVertex(gVertices[b+4],x1,1.0f,-y0,Surface_Solid,u1,v0);writeVertex(gVertices[b+5],x0,1.0f,-y0,Surface_Solid,u0,v0);gWeaponVertexStart[i]=b;gWeaponVertexValid[i]=true;vertexCount+=6u;
+    }
+    // DF3DS_C3D43_VPARITY1_V2: exact classic post-window portal coverage.
+    const std::uint32_t c43CoverageStart=vertexCount;std::uint32_t c43CoverageVerts=0;
+    if(gC43Mode==C43_CLASSIC_PORTAL_COVERAGE){for(std::uint32_t i=0;i<gC43PortalColumnCount;++i){if(vertexCount+6u>kVertexCapacity){++gVertexOverflow;break;}const C43PortalColumn& pc=gC43PortalColumns[i];const float x0=float(pc.x)*1.25f,x1=float(pc.x+1)*1.25f,y0=float(pc.top)*1.20f,y1=float(pc.bottom+1)*1.20f;const SurfaceClass cls=SurfaceClass(pc.surfaceClass);writeVertex(gVertices[vertexCount],x0,1.0f,-y0,cls,0,0);writeVertex(gVertices[vertexCount+1],x0,1.0f,-y1,cls,0,0);writeVertex(gVertices[vertexCount+2],x1,1.0f,-y1,cls,0,0);writeVertex(gVertices[vertexCount+3],x1,1.0f,-y1,cls,0,0);writeVertex(gVertices[vertexCount+4],x1,1.0f,-y0,cls,0,0);writeVertex(gVertices[vertexCount+5],x0,1.0f,-y0,cls,0,0);vertexCount+=6u;c43CoverageVerts+=6u;}}
+    // DF3DS_C3D37_SENTINEL1_V1: unconditional native screen-space sentinel.
+    std::uint32_t c37SentinelStart=vertexCount;bool c37SentinelValid=false;
+    if(vertexCount+6u<=kVertexCapacity)
+    {
+        const float sx0=8.0f,sy0=8.0f,sx1=18.0f+float(gC43Mode)*48.0f,sy1=28.0f;
+        writeVertex(gVertices[vertexCount],sx0,1.0f,-sy0,Surface_Upper,0.0f,0.0f);
+        writeVertex(gVertices[vertexCount+1],sx0,1.0f,-sy1,Surface_Upper,0.0f,0.0f);
+        writeVertex(gVertices[vertexCount+2],sx1,1.0f,-sy1,Surface_Upper,0.0f,0.0f);
+        writeVertex(gVertices[vertexCount+3],sx1,1.0f,-sy1,Surface_Upper,0.0f,0.0f);
+        writeVertex(gVertices[vertexCount+4],sx1,1.0f,-sy0,Surface_Upper,0.0f,0.0f);
+        writeVertex(gVertices[vertexCount+5],sx0,1.0f,-sy0,Surface_Upper,0.0f,0.0f);
+        vertexCount+=6u;c37SentinelValid=true;
+    }
+    otCaptureFrame();
+    GSPGPU_FlushDataCache(gVertices,sizeof(OneWallVertex)*vertexCount);C3D_BindProgram(&gProgram);C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER,gProjectionUniform,&gProjection);C3D_AttrInfo* attr=C3D_GetAttrInfo();AttrInfo_Init(attr);AttrInfo_AddLoader(attr,0,GPU_FLOAT,4);AttrInfo_AddLoader(attr,1,GPU_FLOAT,4);AttrInfo_AddLoader(attr,2,GPU_FLOAT,4);C3D_BufInfo* buf=C3D_GetBufInfo();BufInfo_Init(buf);BufInfo_Add(buf,gVertices,sizeof(OneWallVertex),3,0x210);C3D_CullFace(GPU_CULL_NONE);C3D_AlphaTest(false,GPU_ALWAYS,0);C3D_DepthMap(true,-1.0f,0.0f);C3D_DepthTest(true,GPU_LEQUAL,GPU_WRITE_ALL);
+    // DF3DS_C3D20_WALLCLASSAUD1_V1: solids stay textured; adjoin classes expose geometry identity by primary color.
+    for(std::uint32_t i=0;i<gDrawCount;++i)
+    {
+        const DrawWall& d=gDraws[i];
+        if(false)continue; // C48 retired
+        if(!gC19WallVertexValid[i])
+        {
+            if(d.surfaceClass==Surface_Upper)++gC20UpperInvalid;
+            else if(d.surfaceClass==Surface_Lower)++gC20LowerInvalid;
+            continue;
+        }
+        C3D_FVUnifSet(GPU_VERTEX_SHADER,gScreenUniform,
+            fixedToFloat(d.focalLength)*1.25f,fixedToFloat(d.focalLenAspect)*1.20f,
+            fixedToFloat(d.projOffsetX)*1.25f,fixedToFloat(d.projOffsetY)*1.20f);
+        NativeTexture* nt=gWallTex[i];
+        if(d.surfaceClass==Surface_Upper)
+        {
+            setTexEnv(nt!=nullptr);if(nt)C3D_TexBind(0,&nt->tex);++gC20UpperDraws; // C48 CLEAN1 textured
+        }
+        else if(d.surfaceClass==Surface_Lower)
+        {
+            const C23LowerFrameVis* c23=c23FindLowerFrame(d.carrier.key,false);
+            if(!c23)
+            {
+                ++gC23LowerUnknownDraws;c23RecordLowerOutcome(d.carrier.key,nullptr,3);
+            }
+            else if(c23->columns>0u&&c23->visibleColumns==0u)
+            {
+                // DF3DS_C3D36_EMPTYTELEM1_V1:
+                // "all empty" is retained as telemetry only. Do not treat zero surviving
+                // pixels in the classic lower pass as proof that the native lower geometry
+                // must be absent; preserve the native draw and let this run test ownership.
+                ++gC23LowerSuppressedDraws;c23RecordLowerOutcome(d.carrier.key,c23,0);
+            }
+            else if(c23->clampedColumns>0u)
+            {
+                ++gC23LowerPartialDraws;c23RecordLowerOutcome(d.carrier.key,c23,1);
+            }
+            else
+            {
+                ++gC23LowerFullDraws;c23RecordLowerOutcome(d.carrier.key,c23,2);
+            }
+
+            // DF3DS_C3D35_NEARPLANE1_V1: C34 fallback neutralized for near-plane diagnosis.
+            // Preserve C33/C28 native lower submission behavior so software-underlay fallback
+            // cannot masquerade as a near/far native clip transition.
+            setTexEnv(nt!=nullptr);if(nt)C3D_TexBind(0,&nt->tex);++gC20LowerDraws; // C48 CLEAN1 textured
+        }
+        else
+        {
+            setTexEnv(nt!=nullptr);if(nt)C3D_TexBind(0,&nt->tex);++gC20SolidDraws; // C48 CLEAN1 textured
+        }
+        if(c57SuppressTarget(d))
+        {
+            c57NoteSuppressed(d);
+            continue;
+        }
+        C3D_DrawArrays(GPU_TRIANGLES,int(gWallVertexStart[i]),6);
+    }
+    std::uint32_t fv=flatStart;for(std::uint32_t i=0;i<gFlatTriCount&&fv+3u<=weaponStart;++i,fv+=3u){const FlatTri& t=gFlatTris[i];C3D_FVUnifSet(GPU_VERTEX_SHADER,gScreenUniform,fixedToFloat(t.focalLength)*1.25f,fixedToFloat(t.focalLenAspect)*1.20f,fixedToFloat(t.projOffsetX)*1.25f,fixedToFloat(t.projOffsetY)*1.20f);NativeTexture* nt=gFlatTex[i];setTexEnv(nt!=nullptr);if(nt)C3D_TexBind(0,&nt->tex);C3D_DrawArrays(GPU_TRIANGLES,int(fv),3);}
+    // DF3DS_C3D18_SIGN1_V1: SIGN overlays color-write against the wall depth; alpha is texture-owned.
+    C3D_DepthTest(true,GPU_LEQUAL,GPU_WRITE_COLOR);setTexEnv(true);
+    for(std::uint32_t i=0;i<gC18SignDrawCount;++i)
+    {
+        const C18SignDraw& sd=gC18SignDraws[i];C3D_FVUnifSet(GPU_VERTEX_SHADER,gScreenUniform,fixedToFloat(sd.focalLength)*1.25f,fixedToFloat(sd.focalLenAspect)*1.20f,fixedToFloat(sd.projOffsetX)*1.25f,fixedToFloat(sd.projOffsetY)*1.20f);
+        C3D_AlphaTest(sd.transparent!=0,GPU_GREATER,0);C3D_TexBind(0,&sd.texture->tex);C3D_DrawArrays(GPU_TRIANGLES,int(sd.vertexStart),6);++gC18SignSubmitted;if(sd.transparent)++gC18SignTransparentSubmitted;if(sd.illumSign)++gC18SignIllumSubmitted;
+    }
+    C3D_AlphaTest(false,GPU_ALWAYS,0);
+    // DF3DS_C3D10_NATIVEPLANES1_V2: first-class native scene billboards share C3D8 depth.
+    C3D_DepthTest(true,GPU_LEQUAL,GPU_WRITE_COLOR);C3D_AlphaTest(true,GPU_GREATER,0);setTexEnv(true);
+    for(std::uint32_t i=0;i<gSpriteLayerCount;++i)
+    {
+        if(!gSpriteVertexValid[i]||!gSpriteTex[i])continue;const SpriteLayer& s=gSpriteLayers[i];SpriteNativeTexture* st=gSpriteTex[i];
+        C3D_FVUnifSet(GPU_VERTEX_SHADER,gScreenUniform,fixedToFloat(s.focalLength)*1.25f,fixedToFloat(s.focalLenAspect)*1.20f,fixedToFloat(s.projOffsetX)*1.25f,fixedToFloat(s.projOffsetY)*1.20f);
+        C3D_TexBind(0,&st->tex);C3D_DrawArrays(GPU_TRIANGLES,int(gSpriteVertexStart[i]),6);++gSummarySpriteSubmitted;if(s.sourceKind==2)++gSummaryFmeSubmitted;else ++gSummaryWaxSubmitted;
+    }
+    C3D_AlphaTest(false,GPU_ALWAYS,0);gSummarySpriteTexUploads=gSpriteTexUploads;gSummarySpriteTexEvicts=gSpriteTexEvicts;gSummarySpriteTexBlocked=gSpriteTexBlocked;
+    if(gSummarySpriteSubmitted&&!gSpriteProofWritten){writeSpriteProof("FIRST_NATIVE_PLANE");gSpriteProofWritten=true;}
+    if(false&&c43CoverageVerts){C3D_DepthTest(false,GPU_ALWAYS,GPU_WRITE_COLOR);C3D_AlphaTest(false,GPU_ALWAYS,0);setTexEnv(false);C3D_FVUnifSet(GPU_VERTEX_SHADER,gScreenUniform,1.0f,1.0f,0.0f,0.0f);C3D_DrawArrays(GPU_TRIANGLES,int(c43CoverageStart),int(c43CoverageVerts));}
+    gSummaryDepthSubmitted=true;C3D_DepthTest(false,GPU_ALWAYS,GPU_WRITE_COLOR);C3D_AlphaTest(true,GPU_GREATER,0);setTexEnv(true);C3D_FVUnifSet(GPU_VERTEX_SHADER,gScreenUniform,1.0f,1.0f,0.0f,0.0f);for(std::uint32_t i=0;i<gWeaponLayerCount;++i){NativeTexture* nt=gWeaponTex[i];if(!nt||!gWeaponVertexValid[i])continue;C3D_TexBind(0,&nt->tex);C3D_DrawArrays(GPU_TRIANGLES,int(gWeaponVertexStart[i]),6);gSummaryWeaponSubmitted=true;++gSummaryWeaponSubmittedCount;}C3D_AlphaTest(false,GPU_ALWAYS,0);
+
+    std::uint32_t c38ReplayDraws=0; // C42: replay disabled; summary field retained.
+
+    if(false&&c37SentinelValid)
+    {
+        C3D_DepthTest(false,GPU_ALWAYS,GPU_WRITE_COLOR);C3D_AlphaTest(false,GPU_ALWAYS,0);setTexEnv(false);
+        C3D_FVUnifSet(GPU_VERTEX_SHADER,gScreenUniform,1.0f,1.0f,0.0f,0.0f);
+        C3D_DrawArrays(GPU_TRIANGLES,int(c37SentinelStart),6);
+    }
+    gPresentedSerial=gFrameSerial;logProofOnce();
+}
+
+
+
+
+
+void shutdown()
+{
+    c57WriteProof();
+
+
+    otWriteLog();
+
+    plFlush("SHUTDOWN");
+    c43LogMode("SHUTDOWN");
+    updateSummary();writeProofLog("FINAL_SHUTDOWN");writeSpriteProof("FINAL_SHUTDOWN");c28WriteCoverageProof("FINAL_SHUTDOWN");c33WriteProof("FINAL_SHUTDOWN");c34WriteProof("FINAL_SHUTDOWN");c35WriteProof("FINAL_SHUTDOWN");c36WriteProof("FINAL_SHUTDOWN");c37WriteProof("FINAL_SHUTDOWN");c38WriteProof("FINAL_SHUTDOWN");c39WriteProof("FINAL_SHUTDOWN");purgeSpriteTextures();gGpuReady=false;purgeTextures();purgeWeaponNativeTextures();if(gVertices){linearFree(gVertices);gVertices=nullptr;}if(gProgramInit){shaderProgramFree(&gProgram);gProgramInit=false;}if(gDvlb){DVLB_Free(gDvlb);gDvlb=nullptr;}gProjectionUniform=-1;gScreenUniform=-1;
+}
+
+
+}

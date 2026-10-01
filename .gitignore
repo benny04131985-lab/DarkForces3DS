@@ -1,0 +1,55 @@
+# Nintendo 3DS build outputs
+*.3dsx
+*.elf
+*.cia
+*.smdh
+*.map
+*.o
+*.obj
+*.d
+
+# Build trees
+build/
+build_3ds/
+cmake-build-*/
+
+# Runtime/development logs and dumps
+*.log
+*.dmp
+Logs/
+Baselines/
+Checkpoints/
+Artifacts/
+SHIP_FREEZE/
+
+# Patch/backups/temp
+*.bak
+*.orig
+*.rej
+*.tmp
+*~
+__pycache__/
+_finish*/
+_rc*/
+
+# Commercial Dark Forces retail data — NEVER COMMIT
+*.GOB
+*.gob
+*.LFD
+*.lfd
+RetailData/
+Retail_Data/
+GameData/
+Game_Data/
+
+# Local runtime data if a user stages an SD layout in the repo
+Platform3DS/data/
+Platform3DS/saves/
+Platform3DS/config/
+Platform3DS/logs/
+
+# IDE / OS
+.vs/
+.idea/
+.DS_Store
+Thumbs.db

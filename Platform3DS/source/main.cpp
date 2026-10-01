@@ -1,0 +1,639 @@
+// DF3DS_V100_RC2_RELEASEQUIET2
+#include "df3ds_ctru.h"
+#include "df3ds_ui1.h"
+
+#include <cstdio>
+#include <cstring>
+
+#include "df3ds_platform.h"
+#include "df3ds_input.h"
+
+#include <TFE_RenderBackend/renderBackend.h>
+#include <TFE_FileSystem/paths.h>
+#include <TFE_System/system.h>
+#include <TFE_Input/input.h>
+#include <TFE_Jedi/Task/task.h>
+#include <TFE_Audio/audioSystem.h>
+#include <TFE_Audio/midiPlayer.h>
+#include <TFE_DarkForces/darkForcesMain.h>
+#include <TFE_Game/igame.h>
+#include <TFE_ForceScript/forceScript.h>
+
+namespace
+{
+    FILE* gLog = nullptr;
+    // DF3DS_RET1_BOTTOMCONSOLE_V73V2
+    bool gRet1BottomUiOwned = false;
+    // DF3DS_RET1_MISSION1_PERF1_V74
+    unsigned long long gRet1HotTraceSuppressed = 0;
+    bool gRet1TraceThrottleAnnounced = false;
+    bool gRet1TaskPumpMissionSeen = false;
+
+    bool ret1HotBreadcrumb(const char* text)
+    {
+        if (!text)
+            return false;
+
+        return std::strncmp(text, "V66 ", 4) == 0
+            || std::strncmp(text, "V68 ", 4) == 0
+            || std::strncmp(text, "V69 ", 4) == 0
+            || std::strncmp(text, "V70 ", 4) == 0;
+    }
+
+    void logLine(const char* s)
+    {
+        if (!gRet1BottomUiOwned)
+            std::printf("%s\n", s);
+
+        if (gLog)
+        {
+            std::fprintf(gLog, "%s\n", s);
+            std::fflush(gLog);
+        }
+    }
+
+    void logKV(const char* key, const char* value)
+    {
+        if (!gRet1BottomUiOwned)
+            std::printf("%-26s : %s\n", key, value);
+
+        if (gLog)
+        {
+            std::fprintf(gLog, "%-26s : %s\n", key, value);
+            std::fflush(gLog);
+        }
+    }
+
+    void openLog()
+    {
+ // DF3DS_V100_RC2_RELEASE_NO_SD_LOG: release build opens no normal-play log.
+}
+
+    bool fileExists(const char* path)
+    {
+        FILE* f = std::fopen(path, "rb");
+
+        if (!f)
+            return false;
+
+        std::fclose(f);
+        return true;
+    }
+
+    void setPaths()
+    {
+        TFE_Paths::setPath(
+            PATH_PROGRAM,
+            "sdmc:/3ds/DarkForces3DS/"
+        );
+
+        TFE_Paths::setPath(
+            PATH_PROGRAM_DATA,
+            "sdmc:/3ds/DarkForces3DS/"
+        );
+
+        TFE_Paths::setPath(
+            PATH_USER_DOCUMENTS,
+            "sdmc:/3ds/DarkForces3DS/"
+        );
+
+        TFE_Paths::setPath(
+            PATH_SOURCE_DATA,
+            "sdmc:/3ds/DarkForces3DS/data/"
+        );
+    }
+}
+// DF3DS_RET1_STACK512K_V49
+// V46 hardware crash: ARM11 data abort at a normal function-entry stack push.
+// PC=0x001FC7D4 SP=0x080101B8 FAR=0x080101B4; FAR == SP-4.
+// libctru's linked default is 32 KiB for this build. Give the full TFE startup
+// path 16x headroom without changing game/renderer semantics.
+extern "C"
+{
+    unsigned int __stacksize__ = 524288u;
+}
+
+
+// DF3DS_RET1_STARTUP_TRACE_V50_BRIDGE
+extern "C" void df3ds_ret1_breadcrumb(const char* text)
+{
+ (void)text;
+ // DF3DS_V100_RC2_RELEASE_NO_BREADCRUMBS
+}
+
+extern "C" void df3ds_ret1_bottom_ui_claim()
+{
+ gRet1BottomUiOwned = true;
+ // DF3DS_V100_RC2_BOTTOM_UI_CLAIM_QUIET
+}
+
+
+int main()
+{
+    gfxInitDefault();
+    // DF3DS_RET1_UI1_V8_V6_ACTIVE
+    DF3DS_UI1::showBootSplash();
+
+    std::printf("DF3D-RET1-RUNTIME1\n");
+    std::printf("================================\n");
+    std::printf("REAL DARK FORCES / TFE runtime\n\n");
+
+    bool isNew3DS = false;
+    APT_CheckNew3DS(&isNew3DS);
+
+    if (isNew3DS)
+        osSetSpeedupEnable(true);
+
+    const bool sdOk = DF3DS::ensureSdLayout();
+    openLog();
+
+    logKV("SD layout", sdOk ? "PASS" : "FAIL");
+    logKV("New 3DS", isNew3DS ? "YES" : "NO");
+    logKV("CPU boost", isNew3DS ? "ON / osSetSpeedupEnable(true)" : "N/A");
+
+    const char* const coreFiles[] =
+    {
+        "DARK.GOB",
+        "SOUNDS.GOB",
+        "TEXTURES.GOB",
+        "SPRITES.GOB",
+    };
+
+    bool retailOk = true;
+
+    for (const char* name : coreFiles)
+    {
+        char path[320];
+
+        std::snprintf(
+            path,
+            sizeof(path),
+            "sdmc:/3ds/DarkForces3DS/data/%s",
+            name
+        );
+
+        const bool present = fileExists(path);
+
+        logKV(name, present ? "FOUND" : "MISSING");
+        retailOk = retailOk && present;
+    }
+
+    if (!retailOk)
+    {
+        logLine("RET1 RETAIL DATA          : FAIL");
+        logLine("Need DARK/SOUNDS/TEXTURES/SPRITES.GOB in data/.");
+        logLine("Press SELECT to exit.");
+
+        while (aptMainLoop())
+        {
+            hidScanInput();
+
+            if (hidKeysDown() & CTR_KEY_SELECT)
+                break;
+
+            gspWaitForVBlank();
+        }
+
+        if (gLog)
+        {
+            std::fprintf(gLog, "DF3D_RET1_EXIT_DATA_FAIL\n");
+            std::fclose(gLog);
+        }
+
+        gfxExit();
+        return 2;
+    }
+
+    setPaths();
+
+    logKV(
+        "TFE source data",
+        TFE_Paths::getPath(PATH_SOURCE_DATA)
+    );
+
+    TFE_System::init(
+        60.0f,
+        true,
+        "DF3D_RET1"
+    );
+
+    WindowState window{};
+
+    std::strncpy(
+        window.name,
+        "Dark Forces 3DS RET1",
+        sizeof(window.name) - 1
+    );
+
+    if (!TFE_RenderBackend::init(window))
+    {
+        logLine("RenderBackend init       : FAIL");
+
+        if (gLog)
+        {
+            std::fprintf(gLog, "DF3D_RET1_EXIT_RENDER_FAIL\n");
+            std::fclose(gLog);
+        }
+
+        gfxExit();
+        return 3;
+    }
+
+    logLine("RenderBackend             : PASS");
+    logLine("Presentation               : BOOT3 Morton/C3D");
+    logLine("Input                      : native HID -> TFE_Input");
+    logLine("Controls                   : Dpad/A/B/START + SELECT quit");
+    logLine("Audio                      : NDSP / TFE MIX V81");
+
+    // Preserve the TFE audio semantic owner while exposing only an inert
+    // platform output device during this first visual runtime proof.
+    logLine("V81 SOUND1 TFE callback -> NDSP");
+    TFE_Audio::init(false, 0);
+
+    // DF3DS_RET1_MIDI_LIFECYCLE_V82_V4
+    // Normal TFE owns MIDI separately from digital audio. RET1 omitted this
+    // lifecycle, so midiPlayer.cpp was link-dead even after the V82 worker fix.
+    const bool midiStarted =
+        TFE_MidiPlayer::init(0, MIDI_TYPE_OPL3);
+    logKV("MIDI OPL3", midiStarted ? "PASS" : "FAIL");
+
+    // DF3DS_RET1_GAME_REGIONS_V51
+    // The normal TFE host owns these regions before any IGame::runGame call.
+    // RET1 previously skipped that lifecycle, leaving both globals null.
+    logLine("TFE game regions           : init");
+    game_init();
+
+    if (!s_gameRegion || !s_levelRegion)
+    {
+        logLine("TFE game regions           : FAIL");
+        TFE_Audio::shutdown();
+        TFE_MidiPlayer::destroy();
+        TFE_RenderBackend::destroy();
+
+        if (gLog)
+        {
+            std::fprintf(gLog, "DF3D_RET1_EXIT_GAME_REGION_FAIL\n");
+            std::fflush(gLog);
+            std::fclose(gLog);
+            gLog = nullptr;
+        }
+
+        gfxExit();
+        return 5;
+    }
+
+    logLine("TFE game regions           : PASS");
+
+    // DF3DS_RET1_FORCESCRIPT_LIFECYCLE_V53
+    // Restore only the source-proven ForceScript engine bootstrap omitted by
+    // the stripped 3DS host. The exact owner was discovered from pinned TFE.
+    logLine("TFE ForceScript            : init BEGIN");
+    TFE_ForceScript::init();
+    logLine("TFE ForceScript            : init PASS");
+
+    TFE_DarkForces::DarkForces game;
+
+    logLine("DarkForces::runGame        : begin");
+
+    const bool gameStarted =
+        game.runGame(0, nullptr, nullptr);
+
+    logKV(
+        "DarkForces::runGame",
+        gameStarted ? "PASS" : "FAIL"
+    );
+
+    if (!gameStarted)
+    {
+        logLine("RET1 runtime init failed; SELECT exits.");
+
+        while (aptMainLoop())
+        {
+            if (!DF3DS_Input::poll())
+                break;
+
+            TFE_Input::endFrame();
+            TFE_RenderBackend::swap(true);
+        }
+
+        DF3DS_Input::releaseAll();
+        logLine("TFE game regions           : destroy after runGame failure");
+        game_destroy();
+        logLine("TFE ForceScript            : destroy after runGame failure");
+        TFE_ForceScript::destroy();
+        TFE_Audio::shutdown();
+        TFE_MidiPlayer::destroy();
+        TFE_RenderBackend::destroy();
+
+        if (gLog)
+        {
+            std::fprintf(gLog, "DF3D_RET1_EXIT_RUNGAME_FAIL\n");
+            std::fclose(gLog);
+        }
+
+        gfxExit();
+        return 4;
+    }
+
+    logLine("RET1 GAME LOOP             : ENTER");
+    logLine("SELECT                     : CLEAN QUIT");
+
+    u32 frames = 0;
+    bool run = true;
+
+    // DF3DS_RET1_FIRSTFRAME_TRACE_V62
+    // DF3DS_RET1_APT_BOUNDARY_V63
+    // DF3DS_RET1_FRAME1_TRACE_V64
+    // DF3DS_RET1_ROLLING_TRACE_V65
+    logLine("V63 DEPLOY CONFIRMED");
+    while (run) // DF3DS_RET1_QUIT_LATCH_V36
+    {
+        if (frames == 0)
+            logLine("V63 A00 aptMainLoop BEGIN");
+        if (frames == 1)
+            logLine("V64 B00 frame1 aptMainLoop BEGIN");
+        if (frames >= 2 && frames <= 31)
+        {
+            char v65Trace[96];
+            std::snprintf(
+                v65Trace, sizeof(v65Trace),
+                "V65 R frame=%lu stage=%s",
+                (unsigned long)frames,
+                "aptMainLoop BEGIN");
+            logLine(v65Trace);
+        }
+        const bool aptAlive = aptMainLoop();
+        if (frames == 0)
+            logLine("V63 A01 aptMainLoop PASS");
+        if (frames == 1)
+            logLine("V64 B01 frame1 aptMainLoop PASS");
+        if (frames >= 2 && frames <= 31)
+        {
+            char v65Trace[96];
+            std::snprintf(
+                v65Trace, sizeof(v65Trace),
+                "V65 R frame=%lu stage=%s",
+                (unsigned long)frames,
+                "aptMainLoop PASS");
+            logLine(v65Trace);
+        }
+
+        if (!aptAlive)
+            break;
+
+        if (frames == 0)
+            logLine("V62 F00 frame0 BODY ENTER");
+        if (frames == 1)
+            logLine("V64 B02 frame1 BODY ENTER");
+        if (frames >= 2 && frames <= 31)
+        {
+            char v65Trace[96];
+            std::snprintf(
+                v65Trace, sizeof(v65Trace),
+                "V65 R frame=%lu stage=%s",
+                (unsigned long)frames,
+                "BODY ENTER");
+            logLine(v65Trace);
+        }
+
+        if (frames == 0)
+            logLine("V62 F01 input poll BEGIN");
+        if (frames == 1)
+            logLine("V64 B03 frame1 input poll BEGIN");
+        if (frames >= 2 && frames <= 31)
+        {
+            char v65Trace[96];
+            std::snprintf(
+                v65Trace, sizeof(v65Trace),
+                "V65 R frame=%lu stage=%s",
+                (unsigned long)frames,
+                "input poll BEGIN");
+            logLine(v65Trace);
+        }
+        run = DF3DS_Input::poll();
+        if (frames == 0)
+            logLine("V62 F02 input poll PASS");
+        if (frames == 1)
+            logLine("V64 B04 frame1 input poll PASS");
+        if (frames >= 2 && frames <= 31)
+        {
+            char v65Trace[96];
+            std::snprintf(
+                v65Trace, sizeof(v65Trace),
+                "V65 R frame=%lu stage=%s",
+                (unsigned long)frames,
+                "input poll PASS");
+            logLine(v65Trace);
+        }
+
+        if (!run)
+            break;
+
+        if (frames == 0)
+            logLine("V62 F03 system update BEGIN");
+        if (frames == 1)
+            logLine("V64 B05 frame1 system update BEGIN");
+        if (frames >= 2 && frames <= 31)
+        {
+            char v65Trace[96];
+            std::snprintf(
+                v65Trace, sizeof(v65Trace),
+                "V65 R frame=%lu stage=%s",
+                (unsigned long)frames,
+                "system update BEGIN");
+            logLine(v65Trace);
+        }
+        TFE_System::update();
+        if (frames == 0)
+            logLine("V62 F04 system update PASS");
+        if (frames == 1)
+            logLine("V64 B06 frame1 system update PASS");
+        if (frames >= 2 && frames <= 31)
+        {
+            char v65Trace[96];
+            std::snprintf(
+                v65Trace, sizeof(v65Trace),
+                "V65 R frame=%lu stage=%s",
+                (unsigned long)frames,
+                "system update PASS");
+            logLine(v65Trace);
+        }
+
+        if (frames == 0)
+            logLine("V62 F05 game loop BEGIN");
+        if (frames == 1)
+            logLine("V64 B07 frame1 game loop BEGIN");
+        if (frames >= 2 && frames <= 31)
+        {
+            char v65Trace[96];
+            std::snprintf(
+                v65Trace, sizeof(v65Trace),
+                "V65 R frame=%lu stage=%s",
+                (unsigned long)frames,
+                "game loop BEGIN");
+            logLine(v65Trace);
+        }
+        // DF3DS_RET1_MISSION1_PERF1_V74: mission runtime is task-owned.
+        const s32 v74TaskBefore = TFE_Jedi::task_getCount();
+        if (v74TaskBefore)
+        {
+            TFE_Jedi::task_run();
+            const s32 v74TaskAfter = TFE_Jedi::task_getCount();
+
+            if (!gRet1TaskPumpMissionSeen)
+            {
+                gRet1TaskPumpMissionSeen = true;
+                if (gLog)
+                {
+                    std::fprintf(
+                        gLog,
+                        "V74 TASK_PUMP first_nonzero before=%ld after=%ld\n",
+                        (long)v74TaskBefore,
+                        (long)v74TaskAfter
+                    );
+                    std::fflush(gLog);
+                }
+            }
+        }
+
+        game.loopGame();
+        if (frames == 0)
+            logLine("V62 F06 game loop PASS");
+        if (frames == 1)
+            logLine("V64 B08 frame1 game loop PASS");
+        if (frames >= 2 && frames <= 31)
+        {
+            char v65Trace[96];
+            std::snprintf(
+                v65Trace, sizeof(v65Trace),
+                "V65 R frame=%lu stage=%s",
+                (unsigned long)frames,
+                "game loop PASS");
+            logLine(v65Trace);
+        }
+
+        if (frames == 0)
+            logLine("V62 F07 render swap BEGIN");
+        if (frames == 1)
+            logLine("V64 B09 frame1 render swap BEGIN");
+        if (frames >= 2 && frames <= 31)
+        {
+            char v65Trace[96];
+            std::snprintf(
+                v65Trace, sizeof(v65Trace),
+                "V65 R frame=%lu stage=%s",
+                (unsigned long)frames,
+                "render swap BEGIN");
+            logLine(v65Trace);
+        }
+        TFE_RenderBackend::swap(true);
+        if (frames == 0)
+            logLine("V62 F08 render swap PASS");
+        if (frames == 1)
+            logLine("V64 B10 frame1 render swap PASS");
+        if (frames >= 2 && frames <= 31)
+        {
+            char v65Trace[96];
+            std::snprintf(
+                v65Trace, sizeof(v65Trace),
+                "V65 R frame=%lu stage=%s",
+                (unsigned long)frames,
+                "render swap PASS");
+            logLine(v65Trace);
+        }
+
+        if (frames == 0)
+            logLine("V62 F09 input endFrame BEGIN");
+        if (frames == 1)
+            logLine("V64 B11 frame1 input endFrame BEGIN");
+        if (frames >= 2 && frames <= 31)
+        {
+            char v65Trace[96];
+            std::snprintf(
+                v65Trace, sizeof(v65Trace),
+                "V65 R frame=%lu stage=%s",
+                (unsigned long)frames,
+                "input endFrame BEGIN");
+            logLine(v65Trace);
+        }
+        TFE_Input::endFrame();
+        if (frames == 0)
+            logLine("V62 F10 input endFrame PASS");
+        if (frames == 1)
+            logLine("V64 B12 frame1 input endFrame PASS");
+        if (frames >= 2 && frames <= 31)
+        {
+            char v65Trace[96];
+            std::snprintf(
+                v65Trace, sizeof(v65Trace),
+                "V65 R frame=%lu stage=%s",
+                (unsigned long)frames,
+                "input endFrame PASS");
+            logLine(v65Trace);
+        }
+
+        if (frames == 0)
+            logLine("V62 F11 frame0 COMPLETE");
+        if (frames == 1)
+            logLine("V64 B13 frame1 COMPLETE");
+        if (frames >= 2 && frames <= 31)
+        {
+            char v65Trace[96];
+            std::snprintf(
+                v65Trace, sizeof(v65Trace),
+                "V65 R frame=%lu stage=%s",
+                (unsigned long)frames,
+                "frame COMPLETE");
+            logLine(v65Trace);
+        }
+        ++frames;
+    }
+
+    char buf[128];
+
+    std::snprintf(
+        buf,
+        sizeof(buf),
+        "%lu",
+        static_cast<unsigned long>(frames)
+    );
+
+    logKV("RET1 frames", buf);
+
+    DF3DS_Input::releaseAll();
+
+    logLine("DarkForces::exitGame       : begin");
+    game.exitGame();
+    logLine("DarkForces::exitGame       : complete");
+
+    logLine("TFE game regions           : destroy");
+    game_destroy();
+    logLine("TFE game regions           : destroyed");
+
+    logLine("TFE ForceScript            : destroy");
+    TFE_ForceScript::destroy();
+    logLine("TFE ForceScript            : destroyed");
+
+    TFE_Audio::shutdown();
+    TFE_MidiPlayer::destroy();
+
+    logLine("RenderBackend destroy      : begin");
+    TFE_RenderBackend::destroy();
+    logLine("RenderBackend destroy      : complete");
+
+    if (gLog)
+    {
+        std::fprintf(
+            gLog,
+            "V74 TRACE_SUPPRESSED count=%llu\n",
+            gRet1HotTraceSuppressed
+        );
+        std::fprintf(gLog, "DF3D_RET1_EXIT_CLEAN\n");
+        std::fflush(gLog);
+        std::fclose(gLog);
+        gLog = nullptr;
+    }
+
+    gfxExit();
+    return 0;
+}

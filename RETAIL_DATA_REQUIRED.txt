@@ -1,0 +1,20 @@
+DARK FORCES 3DS — RETAIL DATA REQUIRED
+
+Commercial game data is not redistributed by DF3DS.
+
+Place legally-owned Dark Forces data in:
+  sdmc:/3ds/DarkForces3DS/data/
+
+Expected core data:
+  DARK.GOB
+  SOUNDS.GOB
+  TEXTURES.GOB
+  SPRITES.GOB
+  LFD/   (copy the complete original folder)
+
+Runtime-owned folders:
+  sdmc:/3ds/DarkForces3DS/saves/
+  sdmc:/3ds/DarkForces3DS/config/
+  sdmc:/3ds/DarkForces3DS/logs/
+
+Do not commit or redistribute the retail GOB/LFD payload with this project.

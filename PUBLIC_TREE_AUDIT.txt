@@ -1,0 +1,30 @@
+DARK FORCES 3DS v1.0.0 — PUBLIC TREE AUDIT
+==============================================================
+milestone=DF3DS-V1.0.0-RC1
+release_3dsx_sha256=adad62025e0675b539e92964b14db23a5399d79f0cb5d10b3b5783b016909bf6
+RESULT=PASS
+
+copied_source_files=1547
+copied_source_bytes=51732050
+
+Skipped source entries:
+       1  blocked-directory
+      13  generated/binary/log
+       2  retail-game-data-extension
+
+Safety scan:
+  generated binaries/logs: NONE
+  commercial GOB/LFD/asset payloads: NONE
+  >=100 MiB GitHub files: NONE
+  50-99 MiB warnings: 0
+  machine-specific C:/Projects paths: NONE
+
+Exact final source gates:
+  aaa44094046152aecd434743c205740d1651d1c492b23faeb05dd8ceffc71751  Platform3DS/include/df3ds_onewall_c3d.h
+  234007e4868dc4d6d73ac037dd191f25ba054ebc6ac159aaa084f4fdda9a6efe  Platform3DS/source/df3ds_dualeye.cpp
+  8535b355857c69e26a4180941248dfe28a38b69e868a8d0d482edefe1881271b  Platform3DS/source/df3ds_input.cpp
+  d973928df2a8cbf51cd84f228608d371a0b03e0db29816d0909d99030aae1b11  Platform3DS/source/df3ds_onewall_c3d.cpp
+  2c81a2f82667f9245d67d88ca2e7b55c07a0d22658c1526ca9ae88f3a7d61324  TFE/TheForceEngine/TFE_DarkForces/mission.cpp
+  be943b888f45d1dab0399c425ca591b2b84fc46219afee6d8ca815579a9194ec  TFE/TheForceEngine/TFE_DarkForces/player.cpp
+  1ee86054b5827c7f41426a29375976c314546b1d98eb36c5203c3502b4722022  TFE/TheForceEngine/TFE_DarkForces/weapon.cpp
+  44f347b09d6c3329b2058b6cd5d3b50b78ebae91a3c374ac3449ff130e5c8b4f  TFE/TheForceEngine/TFE_Jedi/Renderer/screenDraw.cpp

@@ -1,0 +1,179 @@
+// DF3DS_SRESET1_DUALEYE1_V5_MODULE
+#include <df3ds_dualeye.h>
+#include <3ds.h>
+#include <cstdio>
+#include <cstring>
+
+// DF3DS_SRESET1_DUALEYE1_V13_MODULE
+namespace DF3DS_DualEye
+{
+namespace
+{
+    alignas(16) std::uint8_t gLeft[FrameBytes]{};
+    alignas(16) std::uint8_t gRight[FrameBytes]{};
+    int gEyeSign = 0;
+    bool gRequested = false;
+    bool gLeftArmed = false;
+    bool gReady = false;
+    float gSlider = 0.0f;
+    std::uint32_t gStereoFrames = 0u;
+    std::uint64_t gFirstPresentMs = 0u;
+    std::uint64_t gLastPresentMs = 0u;
+    std::uint64_t gMaxFrameDeltaMs = 0u;
+    std::uint32_t gMaxSliderMilli = 0u;
+    std::uint32_t gCamLeftCalls = 0u;
+    std::uint32_t gCamRightCalls = 0u;
+    std::uint32_t gCamCenterCalls = 0u;
+    std::uint32_t gCamLeftMaxDelta = 0u;
+    std::uint32_t gCamRightMaxDelta = 0u;
+
+    std::uint32_t deltaAbs(std::int32_t a, std::int32_t b)
+    {
+        std::int64_t d = static_cast<std::int64_t>(a) -
+                         static_cast<std::int64_t>(b);
+        if (d < 0) d = -d;
+        return static_cast<std::uint32_t>(d);
+    }
+
+    // V12 diagnostic: full-slider separation = 1.0 DF world unit total
+    // (0.5/eye). Intentionally obvious; tune down after owner proof.
+    constexpr float kHalfSeparationFixed = 3686.0;
+}
+
+void beginFrame()
+{
+    gEyeSign = 0;
+    gLeftArmed = false;
+    gReady = false;
+    gSlider = osGet3DSliderState();
+    if (gSlider < 0.0f) gSlider = 0.0f;
+    if (gSlider > 1.0f) gSlider = 1.0f;
+    gRequested = gSlider > 0.01f;
+    const std::uint32_t sm = static_cast<std::uint32_t>(gSlider * 1000.0f + 0.5f);
+    if (sm > gMaxSliderMilli) gMaxSliderMilli = sm;
+}
+
+bool armLeft()
+{
+    if (!gRequested)
+    {
+        gEyeSign = 0;
+        gLeftArmed = false;
+        return false;
+    }
+    gEyeSign = -1;
+    gLeftArmed = true;
+    return true;
+}
+
+void finishLeftWorld()
+{
+    gEyeSign = 0;
+}
+
+bool leftArmed()
+{
+    return gLeftArmed;
+}
+
+std::uint8_t* beginRightFromLeft(const void* left, std::size_t size)
+{
+    if (!gLeftArmed || !left || size < FrameBytes)
+    {
+        cancel();
+        return nullptr;
+    }
+    std::memcpy(gLeft, left, FrameBytes);
+    std::memcpy(gRight, left, FrameBytes);
+    gEyeSign = +1;
+    return gRight;
+}
+
+void commitRight()
+{
+    gEyeSign = 0;
+    gReady = gLeftArmed;
+}
+
+void cancel()
+{
+    gEyeSign = 0;
+    gLeftArmed = false;
+    gReady = false;
+}
+
+int eyeSign() { return gEyeSign; }
+
+std::int32_t eyeOffsetFixed()
+{
+    if (!gEyeSign || !gRequested) return 0;
+    const float mag = kHalfSeparationFixed * gSlider;
+    const std::int32_t fixed = static_cast<std::int32_t>(mag + 0.5f);
+    return gEyeSign < 0 ? -fixed : fixed;
+}
+
+// DF3DS_STEREO2_DIRECTEYE1_MODULE: DIRECTEYE never reads gEyeSign for camera identity.
+std::int32_t halfSeparationFixed()
+{
+    if (!gRequested) return 0;
+    const float mag = kHalfSeparationFixed * gSlider;
+    return static_cast<std::int32_t>(mag + 0.5f);
+}
+
+
+void noteCameraInput(
+    int sign,
+    std::int32_t baseX,
+    std::int32_t baseZ,
+    std::int32_t shiftedX,
+    std::int32_t shiftedZ)
+{
+    const std::uint32_t dx = deltaAbs(shiftedX, baseX);
+    const std::uint32_t dz = deltaAbs(shiftedZ, baseZ);
+    const std::uint32_t d = dx > dz ? dx : dz;
+
+    if (sign < 0)
+    {
+        ++gCamLeftCalls;
+        if (d > gCamLeftMaxDelta) gCamLeftMaxDelta = d;
+    }
+    else if (sign > 0)
+    {
+        ++gCamRightCalls;
+        if (d > gCamRightMaxDelta) gCamRightMaxDelta = d;
+    }
+    else
+    {
+        ++gCamCenterCalls;
+    }
+}
+
+bool ready() { return gReady; }
+const std::uint8_t* leftFrame() { return gLeft; }
+const std::uint8_t* rightFrame() { return gRight; }
+
+void onStereoPresented()
+{
+    const std::uint64_t now = osGetTime();
+    if (!gStereoFrames)
+        gFirstPresentMs = now;
+    if (gLastPresentMs)
+    {
+        const std::uint64_t d = now - gLastPresentMs;
+        if (d > gMaxFrameDeltaMs) gMaxFrameDeltaMs = d;
+    }
+    gLastPresentMs = now;
+    ++gStereoFrames;
+
+    // A pair is presentation ownership for exactly one frame.  Never let a
+    // completed gameplay pair leak into a subsequent menu/loading upload.
+    gReady = false;
+    gLeftArmed = false;
+    gEyeSign = 0;
+}
+
+void shutdownSummary()
+{
+ // V100 RC1: stereo summary logging disabled.
+}
+}
